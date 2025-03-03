@@ -229,12 +229,13 @@ class SwitchingDevice(object):
 	_dbusService = None
 	_settings = None
 
-	def __init__(self, product_id, interface, serial=""):
+	def __init__(self, product_id, tty="", interface="", serial=""):
 		self._productId = product_id
 		self._interface = interface
 		self._serial = serial
-		self._productNameSettings = 'gxioextender%s' % self._interface
-		self._serviceName = 'com.victronenergy.switch.%s' % self._interface
+		self._tty = tty
+		self._productNameSettings = 'gxioextender%s' % self._tty
+		self._serviceName = 'com.victronenergy.switch.%s' % self._tty
 		
 		self.paths['/CustomName'] = {'value': self._productName, 'writeable': True, 'onchangecallback': self._handle_changed_value}
 		self.paths['/Serial'] = {'value': self._serial, 'writeable': False}
@@ -426,8 +427,10 @@ class SwitchingDevice(object):
 
 class GxIoExtender(SwitchingDevice):
 	_productName = 'GX IO extender 150'
-	def __init__(self, interface, config_file):
-		self._serial, self.pins = self.parse_config(config_file)
+	def __init__(self, serial):
+		config_file = "/run/io-ext/{}/pins.conf".format(serial)
+		self._serial = serial
+		self.pins = self.parse_config(config_file)
 
 		for pin in self.pins:
 			output_type = pin.output_type
@@ -447,7 +450,7 @@ class GxIoExtender(SwitchingDevice):
 			if output_type == OUTPUT_TYPE_DIMMABLE:
 				self.settings['dimming_%s' % channel] = ['/Settings/{}/{}/Dimming'.format(self._serial, channel), 0, 0, 255]
 
-		super(GxIoExtender, self).__init__(0xAAAA, interface, serial=self._serial)
+		super(GxIoExtender, self).__init__(0xAAAA, tty=serial, interface="USB", serial=serial)
 
 		for pin in self.pins:
 			# Set the initial state
@@ -491,15 +494,9 @@ class GxIoExtender(SwitchingDevice):
 	def parse_config(self, conf):
 		f = open(conf)
 
-		serial = None
 		pins = []
-
 		for line in f:
 			cmd, arg = line.strip().split(maxsplit=1)
-
-			if cmd == 'serial':
-				serial = arg
-				continue
 
 			if cmd == 'relay':
 				pth, id = arg.split(maxsplit=1)
@@ -532,11 +529,11 @@ class GxIoExtender(SwitchingDevice):
 				continue
 
 		f.close()
-		return serial, pins
+		return pins
 
 if __name__ == '__main__':
 	parser = ArgumentParser(description=sys.argv[0])
-	parser.add_argument('-c', '--conf', default=None, help='Config file')
+	parser.add_argument('-s', '--serial', default=None, help='serial number')
 	parser.add_argument('-d', '--debug', help='set logging level to debug',
 						action='store_true')
 	args = parser.parse_args()
@@ -548,7 +545,7 @@ if __name__ == '__main__':
 	# Have a mainloop, so we can send/receive asynchronous calls to and from dbus
 	DBusGMainLoop(set_as_default=True)
 
-	ioExtender = GxIoExtender('ttyUSB0', args.conf)
+	ioExtender = GxIoExtender(args.serial)
 	signal.signal(signal.SIGTERM, ioExtender.terminate)
 	signal.signal(signal.SIGINT, ioExtender.terminate)
 
