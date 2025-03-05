@@ -408,7 +408,6 @@ class SwitchingDevice(object):
 		bus = dbus.Bus.get_session(private=True) if 'DBUS_SESSION_BUS_ADDRESS' \
 				in os.environ else dbus.Bus.get_system(private=True)
 
-		print(self._serviceName, bus)
 		dbusService = VeDbusService(self._serviceName, bus=bus, register=False)
 		dbusService.add_mandatory_paths(
 			processname=sys.argv[0],
@@ -428,9 +427,10 @@ class SwitchingDevice(object):
 class GxIoExtender(SwitchingDevice):
 	_productName = 'GX IO extender 150'
 	def __init__(self, serial):
-		config_file = "/run/io-ext/{}/pins.conf".format(serial)
+		self._config_file = "/run/io-ext/{}/pins.conf".format(serial)
+		self._check_config()
 		self._serial = serial
-		self.pins = self.parse_config(config_file)
+		self.pins = self.parse_config(self._config_file)
 
 		for pin in self.pins:
 			output_type = pin.output_type
@@ -464,6 +464,12 @@ class GxIoExtender(SwitchingDevice):
 				self._dbusService['/SwitchableOutput/{}/State'.format(pin.name)] = pin.state
 			self._dbusService['/SwitchableOutput/{}/Status'.format(pin.name)] = pin.status
 			self._dbusService['/SwitchableOutput/{}/Settings/CustomName'.format(pin.name)] = self._settings['customname_%s' % pin.name]
+
+	def _check_config(self):
+		if os.path.exists(self._config_file):
+			return True
+		self.terminate(None, None)
+		return
 
 	def status_cb(self, pin):
 		if self._dbusService:
