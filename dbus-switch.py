@@ -17,7 +17,7 @@ from logger import setup_logging
 from vedbus import VeDbusService, VeDbusItemImport
 from settingsdevice import SettingsDevice
 
-VERSION = '0.2'
+VERSION = '0.3'
 
 OUTPUT_TYPE_MOMENTARY = 0
 OUTPUT_TYPE_LATCHING = 1
