@@ -18,6 +18,7 @@ from vedbus import VeDbusService, VeDbusItemImport
 from settingsdevice import SettingsDevice
 
 VERSION = '0.3'
+PRODUCT_ID = 0xC01A
 
 OUTPUT_TYPE_MOMENTARY = 0
 OUTPUT_TYPE_LATCHING = 1
@@ -450,7 +451,7 @@ class GxIoExtender(SwitchingDevice):
 			if output_type == OUTPUT_TYPE_DIMMABLE:
 				self.settings['dimming_%s' % channel] = ['/Settings/{}/{}/Dimming'.format(self._serial, channel), 0, 0, 255]
 
-		super(GxIoExtender, self).__init__(0xAAAA, tty=serial, interface="USB", serial=serial)
+		super(GxIoExtender, self).__init__(PRODUCT_ID, tty=serial, interface="USB", serial=serial)
 
 		for pin in self.pins:
 			# Set the initial state
