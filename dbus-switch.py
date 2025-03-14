@@ -2,8 +2,6 @@
 
 import sys, os
 import signal
-from threading import Thread
-from select import select, epoll, EPOLLPRI
 from functools import partial
 from collections import namedtuple
 from argparse import ArgumentParser
