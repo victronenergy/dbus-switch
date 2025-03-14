@@ -52,7 +52,7 @@ class Pin():
 	store_state = True
 	_state = 0
 	_status = STATUS_DISABLED
-	
+
 	def __init__(self, name=None, path=None, label=None, fb = None, status_cb=None):
 		self.name = name
 		self.path = path
@@ -70,11 +70,11 @@ class Pin():
 	@state.setter
 	def state(self, state):
 		raise NotImplementedError
-	
+
 	@property
 	def status(self):
 		return self._status
-	
+
 	@status.setter
 	def status(self, status):
 		self._status = status
@@ -121,7 +121,7 @@ class PwmPin(Pin):
 	@property
 	def dimming(self):
 		return self._dimming
-	
+
 	@dimming.setter
 	def dimming(self, dimming):
 		self._dimming = dimming
@@ -235,7 +235,7 @@ class SwitchingDevice(object):
 		self._tty = tty
 		self._productNameSettings = 'gxioextender%s' % self._tty
 		self._serviceName = 'com.victronenergy.switch.%s' % self._tty
-		
+
 		self.paths['/CustomName'] = {'value': self._productName, 'writeable': True, 'onchangecallback': self._handle_changed_value}
 		self.paths['/Serial'] = {'value': self._serial, 'writeable': False}
 		self.paths['/State'] = {'value': MODULE_STATE_CONNECTED, 'writeable': False, 
@@ -355,7 +355,7 @@ class SwitchingDevice(object):
 				str += ", "
 			str += "Momentary"
 		return str
-	
+
 	def _valid_functions_text_callback(self, path, value):
 		str = ""
 		if value & (1 << OUTPUT_FUNCTION_ALARM):
@@ -389,7 +389,7 @@ class SwitchingDevice(object):
 		elif path.endswith('/Type'):
 			validTypesPath = path.replace('/Type', '/ValidTypes')
 			return (1 << value) & self._dbusService[validTypesPath] 
-		
+
 		elif path.endswith('/Function'):
 			validFunctionsPath = path.replace('/Function', '/ValidFunctions')
 			return (1 << value) & self._dbusService[validFunctionsPath]
@@ -402,7 +402,7 @@ class SwitchingDevice(object):
 		bus = dbus.Bus.get_session(private=True) if 'DBUS_SESSION_BUS_ADDRESS' \
 				in os.environ else dbus.Bus.get_system(private=True)
 		return SettingsDevice(bus, *args, timeout=10, **kwargs)
-	
+
 	def _create_dbus_service(self):
 		bus = dbus.Bus.get_session(private=True) if 'DBUS_SESSION_BUS_ADDRESS' \
 				in os.environ else dbus.Bus.get_system(private=True)
