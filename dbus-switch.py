@@ -258,10 +258,11 @@ class SwitchingDevice(object):
 		# Register on dbus
 		self._dbusService.register()
 
-	def add_output(self, channel, output_type, set_state_cb, customName="", set_dimming_cb=None):
+	def add_output(self, channel, output_type, set_state_cb, name="", customName="", set_dimming_cb=None):
 		path_base  = '/SwitchableOutput/{}/'.format(channel)
 		self.paths[path_base + 'State'] = {'value': 0, 'writeable': True, 'onchangecallback': set_state_cb}
 		self.paths[path_base + 'Status'] = {'value': 0, 'writeable': False, 'gettextcallback': self._status_text_callback}
+		self.paths[path_base + 'Name'] = {'value': name, 'writeable': False}
 
 		if output_type == OUTPUT_TYPE_DIMMABLE:
 			self.paths[path_base + "Dimming"] = {'value': 0, 'writeable': True, 'onchangecallback': set_dimming_cb, 'gettextcallback': lambda x, y: str(y) + '%'}
@@ -437,7 +438,7 @@ class GxIoExtender(SwitchingDevice):
 
 			self.add_output(channel, output_type, 
 				   partial(self.set_hw_state, pin, 'state_%s' % channel),
-				   customName=pin.label,
+				   name=pin.label,
 				   set_dimming_cb=
 				   partial(self.set_dimming, pin, 'dimming_%s' % channel) if output_type == OUTPUT_TYPE_DIMMABLE else None)
 
@@ -503,10 +504,10 @@ class GxIoExtender(SwitchingDevice):
 		for line in f:
 			cmd, arg = line.strip().split(maxsplit=1)
 
-			if cmd == 'relay':
+			if cmd == 'relay' or cmd == 'ssr':
 				pth, id = arg.split(maxsplit=1)
 				name = "relay_" + id
-				label = "Relay " + id
+				label = ("Relay " if cmd == 'relay' else "Solid state relay ") + id
 
 				pths = []
 				for x in os.listdir(os.path.dirname(pth)):
