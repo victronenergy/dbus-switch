@@ -15,7 +15,7 @@ from logger import setup_logging
 from vedbus import VeDbusService, VeDbusItemImport
 from settingsdevice import SettingsDevice
 
-VERSION = '0.5'
+VERSION = '0.6'
 PRODUCT_ID = 0xC01A
 
 OUTPUT_TYPE_MOMENTARY = 0
