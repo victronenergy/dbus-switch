@@ -233,19 +233,18 @@ class SwitchingDevice(object):
 		self._interface = interface
 		self._serial = serial
 		self._tty = tty
-		self._productNameSettings = 'gxioextender%s' % self._tty
+		self._productNameSettings = 'gxio_%s' % self._tty
 		self._serviceName = 'com.victronenergy.switch.%s' % self._tty
 
-		self.paths['/CustomName'] = {'value': self._productName, 'writeable': True, 'onchangecallback': self._handle_changed_value}
-		self.paths['/Serial'] = {'value': self._serial, 'writeable': False}
-		self.paths['/State'] = {'value': MODULE_STATE_CONNECTED, 'writeable': False, 
-						  'onchangecallback': self._handle_changed_value, 'gettextcallback': self._module_state_text_callback}
-
 		# Obtain the class and vrm instance from localsettings
-		self.settings['deviceinstance'] =  ['/Settings/Devices/%s/ClassAndVrmInstance' % self._productNameSettings, "switch:1", "", ""]
-		self.settings['customname'] = ['/Settings/Devices/%s/CustomName' % self._productNameSettings, self._productName, "", ""]
-
+		self.settings['deviceinstance'] =  ['/Settings/Devices/%s/ClassAndVrmInstance' % self._productNameSettings, "switch:50", "", ""]
+		self.settings['customname'] = ['/Settings/Devices/%s/CustomName' % self._productNameSettings, "", "", ""]
 		self._settings = self._create_settings(self.settings, self._handle_changed_setting)
+
+		self.paths['/CustomName'] = {'value': self._settings['customname'], 'writeable': True, 'onchangecallback': self._handle_changed_value}
+		self.paths['/Serial'] = {'value': self._serial, 'writeable': False}
+		self.paths['/State'] = {'value': MODULE_STATE_CONNECTED, 'writeable': False, 'gettextcallback': self._module_state_text_callback}
+
 		self._dbusService = self._create_dbus_service()
 
 		for k, v in self.paths.items():
@@ -259,7 +258,7 @@ class SwitchingDevice(object):
 		self._dbusService.register()
 
 	def add_output(self, channel, output_type, set_state_cb, name="", customName="", set_dimming_cb=None):
-		path_base  = '/SwitchableOutput/{}/'.format(channel)
+		path_base  = '/SwitchableOutput/%s/' % channel
 		self.paths[path_base + 'State'] = {'value': 0, 'writeable': True, 'onchangecallback': set_state_cb}
 		self.paths[path_base + 'Status'] = {'value': 0, 'writeable': False, 'gettextcallback': self._status_text_callback}
 		self.paths[path_base + 'Name'] = {'value': name, 'writeable': False}
@@ -272,9 +271,9 @@ class SwitchingDevice(object):
 		validTypesLatching = 1 << OUTPUT_TYPE_LATCHING
 		validTypesMomentary = 1 << OUTPUT_TYPE_MOMENTARY
 
-		self.paths[path_base + 'Settings/Group'] = {'value': "", 'writeable': True}
+		self.paths[path_base + 'Settings/Group'] = {'value': "", 'writeable': True, 'onchangecallback': self._handle_changed_value}
 		self.paths[path_base + 'Settings/CustomName'] = {'value': customName, 'writeable': True, 'onchangecallback': self._handle_changed_value}
-		self.paths[path_base + 'Settings/ShowUIControl'] = {'value': 1, 'writeable': True}
+		self.paths[path_base + 'Settings/ShowUIControl'] = {'value': 1, 'writeable': True, 'onchangecallback': self._handle_changed_value}
 		self.paths[path_base + 'Settings/Type'] = {'value': output_type, 'writeable': True, 'onchangecallback': self._handle_changed_value,
 							'gettextcallback': self._type_text_callback}
 		self.paths[path_base + 'Settings/ValidTypes'] = {'value': validTypesDimmable if
@@ -397,7 +396,10 @@ class SwitchingDevice(object):
 		return True
 
 	def _handle_changed_setting(self, path, oldvalue, newvalue):
-		return True
+		if path == 'customname':
+			self._dbusService['/CustomName'] = newvalue
+			return True
+		return False
 
 	def _create_settings(self, *args, **kwargs):
 		bus = dbus.Bus.get_session(private=True) if 'DBUS_SESSION_BUS_ADDRESS' \
@@ -426,6 +428,7 @@ class SwitchingDevice(object):
 
 class GxIoExtender(SwitchingDevice):
 	_productName = 'GX IO extender 150'
+	_write_dimming_timer = None
 	def __init__(self, serial):
 		self._config_file = "/run/io-ext/{}/pins.conf".format(serial)
 		self._check_config()
@@ -436,34 +439,47 @@ class GxIoExtender(SwitchingDevice):
 			output_type = pin.output_type
 			channel = pin.name
 
-			self.add_output(channel, output_type, 
-				   partial(self.set_hw_state, pin, 'state_%s' % channel),
+			self.add_output(channel, output_type,
+				   partial(self.set_hw_state, pin, 'State_%s' % channel),
 				   name=pin.label,
 				   set_dimming_cb=
-				   partial(self.set_dimming, pin, 'dimming_%s' % channel) if output_type == OUTPUT_TYPE_DIMMABLE else None)
+				   partial(self.set_dimming, pin, 'Dimming_%s' % channel) if output_type == OUTPUT_TYPE_DIMMABLE else None)
 
-			self.settings['customname_%s' % channel] = ['/Settings/{}/{}/CustomName'.format(self._serial, channel), '', '', '']
+			self.settings['Group_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Group' % (self._serial, channel), '', '', '']
+			self.settings['CustomName_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/CustomName' % (self._serial, channel), '', '', '']
+			self.settings['ShowUIControl_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/ShowUIControl' % (self._serial, channel), 1, 0, 1]
+			self.settings['Type_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Type' % (self._serial, channel), output_type, 0, 2]
+			# No setting for function, as it can only be manual.
 			if pin.store_state:
-				self.settings['state_%s' % channel] = ['/Settings/{}/{}/State'.format(self._serial, channel), 0, 0, 1]
-			self.settings['type_%s' % channel] = ['/Settings/{}/{}/Type'.format(self._serial, channel), output_type, 0, 2]
+				self.settings['State_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/State' % (self._serial, channel), 0, 0, 1]
 
 			if output_type == OUTPUT_TYPE_DIMMABLE:
-				self.settings['dimming_%s' % channel] = ['/Settings/{}/{}/Dimming'.format(self._serial, channel), 0, 0, 255]
+				self.settings['Dimming_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Dimming' % (self._serial, channel), 0, 0, 255]
 
 		super(GxIoExtender, self).__init__(PRODUCT_ID, tty=serial, interface="USB", serial=serial)
 
 		for pin in self.pins:
+			channel = pin.name
 			# Set the initial state
 			if pin.store_state:
 				if pin.output_type == OUTPUT_TYPE_DIMMABLE:
-					self._dbusService['/SwitchableOutput/{}/Dimming'.format(pin.name)] = self._settings['dimming_%s' % pin.name]
-					pin.dimming = self._settings['dimming_%s' % pin.name]
-				self._dbusService['/SwitchableOutput/{}/State'.format(pin.name)] = self._settings['state_%s' % pin.name]
-				pin.state = self._settings['state_%s' % pin.name]
+					self._dbusService['/SwitchableOutput/%s/Dimming' % channel] = self._settings['Dimming_%s' % channel]
+					pin.dimming = self._settings['Dimming_%s' % channel]
+				self._dbusService['/SwitchableOutput/%s/State' % channel] = self._settings['State_%s' % channel]
+				pin.state = self._settings['State_%s' % channel]
 			else:
-				self._dbusService['/SwitchableOutput/{}/State'.format(pin.name)] = pin.state
-			self._dbusService['/SwitchableOutput/{}/Status'.format(pin.name)] = pin.status
-			self._dbusService['/SwitchableOutput/{}/Settings/CustomName'.format(pin.name)] = self._settings['customname_%s' % pin.name]
+				self._dbusService['/SwitchableOutput/%s/State' % channel] = pin.state
+			self._dbusService['/SwitchableOutput/%s/Status' % channel] = pin.status
+			self._dbusService['/SwitchableOutput/%s/Settings/CustomName' % channel] = self._settings['CustomName_%s' % channel]
+			self._dbusService['/SwitchableOutput/%s/Settings/Group' % channel] = self._settings['Group_%s' % channel]
+			self._dbusService['/SwitchableOutput/%s/Settings/ShowUIControl' % channel] = self._settings['ShowUIControl_%s' % channel]
+			self._dbusService['/SwitchableOutput/%s/Settings/Type' % channel] = self._settings['Type_%s' % channel]
+
+	def terminate(self, signum, frame):
+		if self._write_dimming_timer:
+			GLib.source_remove(self._write_dimming_timer)
+			self._write_dimming()
+		return super().terminate(signum, frame)
 
 	def _check_config(self):
 		if os.path.exists(self._config_file):
@@ -473,7 +489,7 @@ class GxIoExtender(SwitchingDevice):
 
 	def status_cb(self, pin):
 		if self._dbusService:
-			self._dbusService['/SwitchableOutput/{}/Status'.format(pin.name)] = pin.status
+			self._dbusService['/SwitchableOutput/%s/Status' % pin.name] = pin.status
 
 	def set_hw_state(self, pin, setting, path, state):
 		pin.state = state
@@ -485,14 +501,29 @@ class GxIoExtender(SwitchingDevice):
 		if state < 0 or state > 100:
 			return False
 		pin.dimming = state
-		self._settings[setting] = pin.dimming
+		# Throttle writing the dimming state to localsettings.
+		if self._write_dimming_timer:
+			GLib.source_remove(self._write_dimming_timer)
+			self._write_dimming_timer = None
+		self._write_dimming_timer = GLib.timeout_add_seconds(1, self._write_dimming)
 		return True
 
+	def _write_dimming(self):
+		for pin in [p for p in self.pins if p.output_type == OUTPUT_TYPE_DIMMABLE]:
+			if pin.dimming != self._settings['Dimming_%s' % pin.name]:
+				self._settings['Dimming_%s' % pin.name] = pin.dimming
+		self._write_dimming_timer = None
+		return False
+
 	def _handle_changed_value(self, path, value):
-		# Store custom name of the output
-		if path.endswith('Settings/CustomName'):
-			channel = path.split('/')[-3]
-			self._settings['customname_%s' % channel] = value
+		# Handle settings changes
+		split = path.split('/')
+		if len(split) > 3 and split[3] == 'Settings':
+			setting = split[-1] + '_' + split[-3]
+			try:
+				self._settings[setting] = value
+			except KeyError:
+				return False
 			return True
 
 		return super(GxIoExtender, self)._handle_changed_value(path, value)
