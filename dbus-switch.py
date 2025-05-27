@@ -386,14 +386,7 @@ class SwitchingDevice(object):
 		if path == '/CustomName':
 			self._settings['customname'] = value
 
-		elif path.endswith('/Type'):
-			validTypesPath = path.replace('/Type', '/ValidTypes')
-			return (1 << value) & self._dbusService[validTypesPath] 
-
-		elif path.endswith('/Function'):
-			validFunctionsPath = path.replace('/Function', '/ValidFunctions')
-			return (1 << value) & self._dbusService[validFunctionsPath]
-		return True
+		return False
 
 	def _handle_changed_setting(self, path, oldvalue, newvalue):
 		if path == 'customname':
@@ -516,7 +509,23 @@ class GxIoExtender(SwitchingDevice):
 		return False
 
 	def _handle_changed_value(self, path, value):
-		# Handle settings changes
+		if path.endswith('/Type'):
+			validTypesPath = path.replace('/Type', '/ValidTypes')
+			if not ((1 << value) & self._dbusService[validTypesPath]):
+				return False
+
+			if int(value) == OUTPUT_TYPE_MOMENTARY:
+				# Reset the state when the momentary type is selected
+				self._dbusService[path.replace('/Settings/Type', '/State')] = 0
+				# Call value changed directly to enforce the callback being called.
+				self._dbusService._value_changed(
+					'/SwitchableOutput/%s/State' % path.split('/')[-3], 0)
+
+		elif path.endswith('/Function'):
+			validFunctionsPath = path.replace('/Function', '/ValidFunctions')
+			if not ((1 << value) & self._dbusService[validFunctionsPath]):
+				return False
+
 		split = path.split('/')
 		if len(split) > 3 and split[3] == 'Settings':
 			setting = split[-1] + '_' + split[-3]
