@@ -19,7 +19,7 @@ VERSION = '0.8'
 PRODUCT_ID = 0xC01A
 
 OUTPUT_TYPE_MOMENTARY = 0
-OUTPUT_TYPE_LATCHING = 1
+OUTPUT_TYPE_TOGGLE = 1
 OUTPUT_TYPE_DIMMABLE = 2
 
 OUTPUT_FUNCTION_ALARM = 0
@@ -143,7 +143,7 @@ class PwmPin(Pin):
 		self.status = STATUS_ON if state else STATUS_OFF
 
 class OutputPin(Pin):
-	output_type = OUTPUT_TYPE_LATCHING
+	output_type = OUTPUT_TYPE_TOGGLE
 
 	@Pin.state.setter
 	def state(self, state):
@@ -161,7 +161,7 @@ class OutputPin(Pin):
 		self.status = STATUS_ON if state else STATUS_OFF
 
 class BiStableRelay(Pin):
-	output_type = OUTPUT_TYPE_LATCHING
+	output_type = OUTPUT_TYPE_TOGGLE
 	PULSELEN = 2000
 	CHECK_INT = 100
 	retries = 0
@@ -268,7 +268,7 @@ class SwitchingDevice(object):
 
 		# Settings
 		validTypesDimmable = 1 << OUTPUT_TYPE_DIMMABLE
-		validTypesLatching = 1 << OUTPUT_TYPE_LATCHING
+		validTypesToggle = 1 << OUTPUT_TYPE_TOGGLE
 		validTypesMomentary = 1 << OUTPUT_TYPE_MOMENTARY
 
 		self.paths[path_base + 'Settings/Group'] = {'value': "", 'writeable': True, 'onchangecallback': self._handle_changed_value}
@@ -277,7 +277,7 @@ class SwitchingDevice(object):
 		self.paths[path_base + 'Settings/Type'] = {'value': output_type, 'writeable': True, 'onchangecallback': self._handle_changed_value,
 							'gettextcallback': self._type_text_callback}
 		self.paths[path_base + 'Settings/ValidTypes'] = {'value': validTypesDimmable if
-							output_type == OUTPUT_TYPE_DIMMABLE else validTypesLatching | validTypesMomentary, 
+							output_type == OUTPUT_TYPE_DIMMABLE else validTypesToggle | validTypesMomentary,
 							'writeable': False, 'gettextcallback': self._valid_types_text_callback}
 		self.paths[path_base + 'Settings/Function'] = {'value': OUTPUT_FUNCTION_MANUAL, 'writeable': True, 'onchangecallback': self._handle_changed_value,
 							'gettextcallback': self._function_text_callback}
@@ -321,8 +321,8 @@ class SwitchingDevice(object):
 	def _type_text_callback(self, path, value):
 		if value == OUTPUT_TYPE_MOMENTARY:
 			return "Momentary"
-		if value == OUTPUT_TYPE_LATCHING:
-			return "Latching"
+		if value == OUTPUT_TYPE_TOGGLE:
+			return "Toggle"
 		if value == OUTPUT_TYPE_DIMMABLE:
 			return "Dimmable"
 		return "Unknown"
@@ -346,10 +346,10 @@ class SwitchingDevice(object):
 		str = ""
 		if value & (1 << OUTPUT_TYPE_DIMMABLE):
 			str += "Dimmable"
-		if value & (1 << OUTPUT_TYPE_LATCHING):
+		if value & (1 << OUTPUT_TYPE_TOGGLE):
 			if str:
 				str += ", "
-			str += "Latching"
+			str += "Toggle"
 		if value & (1 << OUTPUT_TYPE_MOMENTARY):
 			if str:
 				str += ", "
