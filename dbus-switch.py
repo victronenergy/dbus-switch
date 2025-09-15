@@ -6,6 +6,7 @@ from functools import partial
 from collections import namedtuple
 from argparse import ArgumentParser
 import traceback
+import threading
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'ext', 'velib_python'))
 
 from dbus.mainloop.glib import DBusGMainLoop
@@ -171,53 +172,65 @@ class BiStableRelay(Pin):
 		self.setpath = set
 		self.respath = res
 		self._state = self.fb_state
+		self._pins_lock = threading.Lock()	# Lock for accessing the HW pins
+		self._state_lock = threading.Lock()	# Lock for accessing _state
 		self.status = STATUS_ON if self._state else STATUS_OFF
 		self._clear_paths()
 
 	@Pin.state.setter
 	def state(self, state):
-		try:
-			with open((self.setpath if state else self.respath) + '/value', 'wt') as w:
-				w.write('1')
-		except IOError:
-			traceback.print_exc()
-			return
+		with self._pins_lock:
+			try:
+				with open((self.setpath if state else self.respath) + '/value', 'wt') as w:
+					w.write('1')
+			except IOError:
+				traceback.print_exc()
+				return
 
-		if self._fb:
+		if self.has_feedback:
 			self.retries = 0
 			self.timer = GLib.timeout_add(self.CHECK_INT, self._waitForState, state)
 		else:
-			print("No fb pin")
 			self.timer = GLib.timeout_add(self.PULSELEN, self.clear)
 			self.status = STATUS_ON if self._state else STATUS_OFF
 
-		self._state = state
+		with self._state_lock:
+			self._state = state
 
 	def _waitForState(self, state):
+		with self._state_lock:
+			if self._state != state:
+				# State has changed while waiting.
+				# Only clear the path that was set to prevent breaking the next change.
+				with self._pins_lock:
+					with open((self.setpath if state else self.respath) + '/value', 'wt') as w:
+						w.write('0')
+				return False # Stop timer
 		self.retries += 1
-		ret = self.state != state and self.retries < self.PULSELEN / self.CHECK_INT
+		ret = self.fb_state != state and self.retries < self.PULSELEN / self.CHECK_INT
 		if not ret:
 			self._clear()
 		return ret
 
 	def _clear(self):
 		if self.has_feedback:
-			if self._state != self.fb_state:
-				self.status = STATUS_OUTPUT_FAULT
-			else:
-				self.status = STATUS_ON if self._state else STATUS_OFF
-
+			with self._state_lock:
+				if self._state != self.fb_state:
+					self.status = STATUS_OUTPUT_FAULT
+				else:
+					self.status = STATUS_ON if self._state else STATUS_OFF
 		self._clear_paths()
 
 	def _clear_paths(self):
-		for path in [self.setpath, self.respath]:
-			try:
-				with open(path + '/value', 'wt') as w:
-					w.write('0')
-			except IOError:
-				traceback.print_exc()
-				return False
-		return True
+		with self._pins_lock:
+			for path in [self.setpath, self.respath]:
+				try:
+					with open(path + '/value', 'wt') as w:
+						w.write('0')
+				except IOError:
+					traceback.print_exc()
+					return False
+			return True
 
 # Base class for all switching devices.
 class SwitchingDevice(object):
