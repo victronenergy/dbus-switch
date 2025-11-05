@@ -453,7 +453,7 @@ class GxIoExtender(SwitchingDevice):
 
 			self.settings['Group_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Group' % (self._serial, channel), '', '', '']
 			self.settings['CustomName_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/CustomName' % (self._serial, channel), '', '', '']
-			self.settings['ShowUIControl_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/ShowUIControl' % (self._serial, channel), 1, 0, 1]
+			self.settings['ShowUIControl_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/ShowUIControl' % (self._serial, channel), 1, 0, 6]
 			self.settings['Type_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Type' % (self._serial, channel), output_type, 0, 2]
 			# No setting for function, as it can only be manual.
 			if pin.store_state:
