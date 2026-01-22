@@ -3,44 +3,63 @@
 import sys, os
 import signal
 from functools import partial
-from collections import namedtuple
 from argparse import ArgumentParser
 import traceback
+import logging
+from enum import IntEnum
 import threading
-sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'ext', 'velib_python'))
+import asyncio
 
-from dbus.mainloop.glib import DBusGMainLoop
-import dbus
-from gi.repository import GLib
-from logger import setup_logging
-from vedbus import VeDbusService, VeDbusItemImport
-from settingsdevice import SettingsDevice
+try:
+	from dbus_fast.aio import MessageBus
+except ImportError:
+	from dbus_next.aio import MessageBus
+
+# 3rd party
+try:
+	from dbus_fast.constants import BusType
+except ImportError:
+	from dbus_next.constants import BusType
+
+sys.path.insert(1, os.path.join(os.path.dirname(__file__), 'ext', 'aiovelib'))
+from aiovelib.service import Service, IntegerItem, TextItem
+from aiovelib.localsettings import Setting
+
+from utils import wait_for_settings, formatters as fmt, logger
 
 VERSION = '0.11'
 PRODUCT_ID = 0xC01A
 
-OUTPUT_TYPE_MOMENTARY = 0
-OUTPUT_TYPE_TOGGLE = 1
-OUTPUT_TYPE_DIMMABLE = 2
+class OutputType(IntEnum):
+	MOMENTARY = 0
+	TOGGLE = 1
+	DIMMABLE = 2
+	RGB = 11
+	TYPE_MAX = RGBW = 13
 
-OUTPUT_FUNCTION_ALARM = 0
-OUTPUT_FUNCTION_GENSET_START_STOP = 1
-OUTPUT_FUNCTION_MANUAL = 2
-OUTPUT_FUNCTION_TANK_PUMP = 3
-OUTPUT_FUNCTION_TEMPERATURE = 4
-OUTPUT_FUNCTION_CONNECTED_GENSET_HELPER_RELAY = 5
+class OutputFunction(IntEnum):
+	ALARM = 0
+	GENSET_START_STOP = 1
+	MANUAL = 2
+	TANK_PUMP = 3
+	TEMPERATURE = 4
+	CONNECTED_GENSET_HELPER_RELAY = 5
+	S2_RM = 6
 
-MODULE_STATE_CONNECTED = 0x100
-MODULE_STATE_OVER_TEMPERATURE = 0x101
-MODULE_STATE_TEMPERATURE_WARNING = 0x102
-MODULE_STATE_CHANNEL_FAULT = 0x103
-MODULE_STATE_CHANNEL_TRIPPED = 0x104
-MODULE_STATE_UNDER_VOLTAGE = 0x105
+class ModuleState(IntEnum):
+	CONNECTED = 0x100
+	OVER_TEMPERATURE = 0x101
+	TEMPERATURE_WARNING = 0x102
+	CHANNEL_FAULT = 0x103
+	CHANNEL_TRIPPED = 0x104
+	UNDER_VOLTAGE = 0x105
 
 STATUS_OFF = 0x00
 STATUS_ON = 0x09
 STATUS_OUTPUT_FAULT = 0x08
 STATUS_DISABLED = 0x20
+
+background_tasks = set()
 
 # Base class for all output types
 class Pin():
@@ -115,7 +134,7 @@ class Pin():
 			return BiStableRelay(name, set, res, label, fb, status_cb)
 
 class PwmPin(Pin):
-	output_type = OUTPUT_TYPE_DIMMABLE
+	output_type = OutputType.DIMMABLE
 	_dimming = 0
 	_state = 0
 
@@ -144,7 +163,7 @@ class PwmPin(Pin):
 		self.status = STATUS_ON if state else STATUS_OFF
 
 class OutputPin(Pin):
-	output_type = OUTPUT_TYPE_TOGGLE
+	output_type = OutputType.TOGGLE
 
 	@Pin.state.setter
 	def state(self, state):
@@ -162,7 +181,7 @@ class OutputPin(Pin):
 		self.status = STATUS_ON if state else STATUS_OFF
 
 class BiStableRelay(Pin):
-	output_type = OUTPUT_TYPE_TOGGLE
+	output_type = OutputType.TOGGLE
 	PULSELEN = 2000
 	CHECK_INT = 100
 	retries = 0
@@ -174,6 +193,7 @@ class BiStableRelay(Pin):
 		self._state = self.fb_state
 		self._pins_lock = threading.Lock()	# Lock for accessing the HW pins
 		self._state_lock = threading.Lock()	# Lock for accessing _state
+		self._timer_task = None
 		self.status = STATUS_ON if self._state else STATUS_OFF
 		self._clear_paths()
 
@@ -187,15 +207,41 @@ class BiStableRelay(Pin):
 				traceback.print_exc()
 				return
 
+		self._cancel_timer()
 		if self.has_feedback:
 			self.retries = 0
-			self.timer = GLib.timeout_add(self.CHECK_INT, self._waitForState, state)
+			self._timer_task = self._schedule_async(self._wait_for_state_async(state))
 		else:
-			self.timer = GLib.timeout_add(self.PULSELEN, self.clear)
+			self._timer_task = self._schedule_async(self._clear_after_pulse())
 			self.status = STATUS_ON if self._state else STATUS_OFF
 
 		with self._state_lock:
 			self._state = state
+
+	def _schedule_async(self, coro):
+		# Assumes this is called on the running asyncio loop thread.
+		return asyncio.get_running_loop().create_task(coro)
+
+	def _cancel_timer(self):
+		if self._timer_task and not self._timer_task.done():
+			self._timer_task.cancel()
+		self._timer_task = None
+
+	async def _clear_after_pulse(self):
+		try:
+			await asyncio.sleep(self.PULSELEN / 1000)
+			self.clear()
+		except asyncio.CancelledError:
+			return
+
+	async def _wait_for_state_async(self, state):
+		try:
+			while True:
+				if not self._waitForState(state):
+					return
+				await asyncio.sleep(self.CHECK_INT / 1000)
+		except asyncio.CancelledError:
+			return
 
 	def _waitForState(self, state):
 		with self._state_lock:
@@ -233,322 +279,311 @@ class BiStableRelay(Pin):
 			return True
 
 # Base class for all switching devices.
-class SwitchingDevice(object):
-
-	_productName = 'Switching device'
-	paths = {}
-	settings = {}
-	_dbusService = None
-	_settings = None
-
-	def __init__(self, product_id, tty="", interface="", serial=""):
-		self._productId = product_id
-		self._interface = interface
-		self._serial = serial
-		self._tty = tty
-		self._productNameSettings = 'gxio_%s' % self._tty
-		self._serviceName = 'com.victronenergy.switch.%s' % self._tty
-
-		# Obtain the class and vrm instance from localsettings
-		self.settings['deviceinstance'] =  ['/Settings/Devices/%s/ClassAndVrmInstance' % self._productNameSettings, "switch:50", "", ""]
-		self.settings['customname'] = ['/Settings/Devices/%s/CustomName' % self._productNameSettings, "", "", ""]
-		self._settings = self._create_settings(self.settings, self._handle_changed_setting)
-
-		self.paths['/CustomName'] = {'value': self._settings['customname'], 'writeable': True, 'onchangecallback': self._handle_changed_value}
-		self.paths['/Serial'] = {'value': self._serial, 'writeable': False}
-		self.paths['/State'] = {'value': MODULE_STATE_CONNECTED, 'writeable': False, 'gettextcallback': self._module_state_text_callback}
-
-		self._dbusService = self._create_dbus_service()
-
-		for k, v in self.paths.items():
-			value = v['value'] if 'value' in v else None
-			writeable = v['writeable'] if 'writeable' in v else None
-			onchangecallback = v['onchangecallback'] if 'onchangecallback' in v else None
-			gettextcallback = v['gettextcallback'] if 'gettextcallback' in v else None
-			self._dbusService.add_path(k, value=value, writeable=writeable, onchangecallback=onchangecallback, gettextcallback=gettextcallback)
-
-		# Register on dbus
-		self._dbusService.register()
-
-	def add_output(self, channel, output_type, set_state_cb, name="", customName="", set_dimming_cb=None):
+class SwitchableOutputMixin(object):
+	async def add_output(self, channel, output_type, set_state_cb, name=None, set_dimming_cb=None, store_state=False, initial_state=None):
 		path_base  = '/SwitchableOutput/%s/' % channel
-		self.paths[path_base + 'State'] = {'value': 0, 'writeable': True, 'onchangecallback': set_state_cb}
-		self.paths[path_base + 'Status'] = {'value': 0, 'writeable': False, 'gettextcallback': self._status_text_callback}
-		self.paths[path_base + 'Name'] = {'value': name, 'writeable': False}
 
-		if output_type == OUTPUT_TYPE_DIMMABLE:
-			self.paths[path_base + "Dimming"] = {'value': 0, 'writeable': True, 'onchangecallback': set_dimming_cb, 'gettextcallback': lambda x, y: str(y) + '%'}
+		# Make settings
+		await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Group", "", alias=f"Group_{channel}"),
+			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/CustomName", "", alias=f"CustomName_{channel}"),
+			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/ShowUIControl", 1, 0, 6, alias=f"ShowUIControl_{channel}"),
+			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Type", output_type, 0, 2, alias=f"Type_{channel}"))
+		# No setting for function, as it can only be manual.
+		if initial_state is None:	# State setting needed if no initial state provided
+			await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/State", 0, 0, 1, alias=f"State_{channel}"))
+
+		if output_type == OutputType.DIMMABLE:
+			await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Dimming", 0, 0, 255, alias=f"Dimming_{channel}"))
+
+		init_state = initial_state if initial_state is not None else self._settings.get_value(self._settings.alias(f'State_{channel}'))
+		self.paths.append(IntegerItem(path_base + 'State', init_state, writeable=True, onchange=set_state_cb))
+		self.paths.append(IntegerItem(path_base + 'Status', STATUS_ON if init_state else STATUS_OFF, writeable=False, text=self._status_text_callback))
+		self.paths.append(TextItem(path_base + 'Name', name, writeable=False))
+
+		if output_type == OutputType.DIMMABLE:
+			self.paths.append(IntegerItem(path_base + "Dimming", self._settings.get_value(self._settings.alias(f'Dimming_{channel}')), writeable=True, onchange=set_dimming_cb, text=lambda y: str(y) + '%'))
 
 		# Settings
-		validTypesDimmable = 1 << OUTPUT_TYPE_DIMMABLE
-		validTypesToggle = 1 << OUTPUT_TYPE_TOGGLE
-		validTypesMomentary = 1 << OUTPUT_TYPE_MOMENTARY
+		validTypesDimmable = 1 << OutputType.DIMMABLE
+		validTypesToggle = 1 << OutputType.TOGGLE
+		validTypesMomentary = 1 << OutputType.MOMENTARY
 
-		self.paths[path_base + 'Settings/Group'] = {'value': "", 'writeable': True, 'onchangecallback': self._handle_changed_value}
-		self.paths[path_base + 'Settings/CustomName'] = {'value': customName, 'writeable': True, 'onchangecallback': self._handle_changed_value}
-		self.paths[path_base + 'Settings/ShowUIControl'] = {'value': 1, 'writeable': True, 'onchangecallback': self._handle_changed_value}
-		self.paths[path_base + 'Settings/Type'] = {'value': output_type, 'writeable': True, 'onchangecallback': self._handle_changed_value,
-							'gettextcallback': self._type_text_callback}
-		self.paths[path_base + 'Settings/ValidTypes'] = {'value': validTypesDimmable if
-							output_type == OUTPUT_TYPE_DIMMABLE else validTypesToggle | validTypesMomentary,
-							'writeable': False, 'gettextcallback': self._valid_types_text_callback}
-		self.paths[path_base + 'Settings/Function'] = {'value': OUTPUT_FUNCTION_MANUAL, 'writeable': True, 'onchangecallback': self._handle_changed_value,
-							'gettextcallback': self._function_text_callback}
-		self.paths[path_base + 'Settings/ValidFunctions'] = {'value': (1 << OUTPUT_FUNCTION_MANUAL), 
-							'writeable': False, 'gettextcallback': self._valid_functions_text_callback}
+		self.paths.append(TextItem(path_base + 'Settings/Group', "", writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/Group')))
+		self.paths.append(TextItem(path_base + 'Settings/CustomName', "", writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/CustomName')))
+		self.paths.append(IntegerItem(path_base + 'Settings/ShowUIControl', 1, writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/ShowUIControl')))
+		self.paths.append(IntegerItem(path_base + 'Settings/Type', output_type, writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/Type'),
+							text=self._type_text_callback))
+		self.paths.append(IntegerItem(path_base + 'Settings/ValidTypes', validTypesDimmable if
+							output_type == OutputType.DIMMABLE else validTypesToggle | validTypesMomentary,
+							writeable=False, text=self._valid_types_text_callback))
+		self.paths.append(IntegerItem(path_base + 'Settings/Function', OutputFunction.MANUAL, writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/Function'),
+							text=self._function_text_callback))
+		self.paths.append(IntegerItem(path_base + 'Settings/ValidFunctions', (1 << OutputFunction.MANUAL),
+							writeable=False, text=self._valid_functions_text_callback))
 
-	def _module_state_text_callback(self, path, value):
-		if value == MODULE_STATE_CONNECTED:
-			return "Connected"
-		if value == MODULE_STATE_OVER_TEMPERATURE:
-			return "Over temperature"
-		if value == MODULE_STATE_TEMPERATURE_WARNING:
-			return "Temperature warning"
-		if value == MODULE_STATE_CHANNEL_FAULT:
-			return "Channel fault"
-		if value == MODULE_STATE_CHANNEL_TRIPPED:
-			return "Channel tripped"
-		if value == MODULE_STATE_UNDER_VOLTAGE:
-			return "Under voltage"
-		return "Unknown"
+	def _status_text_callback(self, value):
+		status_map = {
+			0x00: "Off",
+			0x09: "On",
+			0x02: "Tripped",
+			0x04: "Over temperature",
+			0x01: "Powered",
+			0x08: "Output fault",
+			0x10: "Short fault",
+			0x20: "Disabled",
+		}
+		return status_map.get(value, "Unknown")
 
-	def _status_text_callback(self, path, value):
-		if value == 0x00:
-			return "Off"
-		if value == 0x09:
-			return "On"
-		if value == 0x02:
-			return "Tripped"
-		if value == 0x04:
-			return "Over temperature"
-		if value == 0x01:
-			return "Powered"
-		if value == 0x08:
-			return "Output fault"
-		if value == 0x10:
-			return "Short fault"
-		if value == 0x20:
-			return "Disabled"
-		return "Unknown"
+	def _type_text_callback(self, value):
+		type_map = {
+			OutputType.MOMENTARY: "Momentary",
+			OutputType.TOGGLE: "Toggle",
+			OutputType.DIMMABLE: "Dimmable",
+			OutputType.RGB: "RGB",
+			OutputType.RGBW: "RGBW",
+		}
+		return type_map.get(value, "Unknown")
 
-	def _type_text_callback(self, path, value):
-		if value == OUTPUT_TYPE_MOMENTARY:
-			return "Momentary"
-		if value == OUTPUT_TYPE_TOGGLE:
-			return "Toggle"
-		if value == OUTPUT_TYPE_DIMMABLE:
-			return "Dimmable"
-		return "Unknown"
+	def _function_text_callback(self, value):
+		function_map = {
+			OutputFunction.ALARM: "Alarm",
+			OutputFunction.GENSET_START_STOP: "Genset start stop",
+			OutputFunction.MANUAL: "Manual",
+			OutputFunction.TANK_PUMP: "Tank pump",
+			OutputFunction.TEMPERATURE: "Temperature",
+			OutputFunction.CONNECTED_GENSET_HELPER_RELAY: "Connected genset helper relay",
+			OutputFunction.S2_RM: "S2 resource manager",
+		}
+		return function_map.get(value, "Unknown")
 
-	def _function_text_callback(self, path, value):
-		if value == OUTPUT_FUNCTION_ALARM:
-			return "Alarm"
-		if value == OUTPUT_FUNCTION_GENSET_START_STOP:
-			return "Genset start stop"
-		if value == OUTPUT_FUNCTION_MANUAL:
-			return "Manual"
-		if value == OUTPUT_FUNCTION_TANK_PUMP:
-			return "Tank pump"
-		if value == OUTPUT_FUNCTION_TEMPERATURE:
-			return "Temperature"
-		if value == OUTPUT_FUNCTION_CONNECTED_GENSET_HELPER_RELAY:
-			return "Connected genset helper relay"
-		return "Unknown"
+	def _bitmask_text(self, value, entries):
+		parts = []
+		for flag, label in entries:
+			if value & (1 << flag):
+				parts.append(label)
+		return ", ".join(parts)
 
-	def _valid_types_text_callback(self, path, value):
-		str = ""
-		if value & (1 << OUTPUT_TYPE_DIMMABLE):
-			str += "Dimmable"
-		if value & (1 << OUTPUT_TYPE_TOGGLE):
-			if str:
-				str += ", "
-			str += "Toggle"
-		if value & (1 << OUTPUT_TYPE_MOMENTARY):
-			if str:
-				str += ", "
-			str += "Momentary"
-		return str
+	def _valid_functions_text_callback(self, value):
+		entries = [
+			(OutputFunction.ALARM, "Alarm"),
+			(OutputFunction.GENSET_START_STOP, "Genset start stop"),
+			(OutputFunction.MANUAL, "Manual"),
+			(OutputFunction.TANK_PUMP, "Tank pump"),
+			(OutputFunction.TEMPERATURE, "Temperature"),
+			(OutputFunction.CONNECTED_GENSET_HELPER_RELAY, "Connected genset helper relay"),
+			(OutputFunction.S2_RM, "S2 resource manager"),
+		]
+		return self._bitmask_text(value, entries)
 
-	def _valid_functions_text_callback(self, path, value):
-		str = ""
-		if value & (1 << OUTPUT_FUNCTION_ALARM):
-			str += "Alarm"
-		if value & (1 << OUTPUT_FUNCTION_GENSET_START_STOP):
-			if str:
-				str += ", "
-			str += "Genset start stop"
-		if value & (1 << OUTPUT_FUNCTION_MANUAL):
-			if str:
-				str += ", "
-			str += "Manual"
-		if value & (1 << OUTPUT_FUNCTION_TANK_PUMP):
-			if str:
-				str += ", "
-			str += "Tank pump"
-		if value & (1 << OUTPUT_FUNCTION_TEMPERATURE):
-			if str:
-				str += ", "
-			str += "Temperature"
-		if value & (1 << OUTPUT_FUNCTION_CONNECTED_GENSET_HELPER_RELAY):
-			if str:
-				str += ", "
-			str += "Connected genset helper relay"
-		return str
+	def _valid_types_text_callback(self, value):
+		entries = [
+			(OutputType.DIMMABLE, "Dimmable"),
+			(OutputType.TOGGLE, "Toggle"),
+			(OutputType.MOMENTARY, "Momentary"),
+			(OutputType.RGB, "RGB"),
+			(OutputType.RGBW, "RGBW"),
+		]
+		return self._bitmask_text(value, entries)
 
-	def _handle_changed_value(self, path, value):
-		if path == '/CustomName':
-			self._settings['customname'] = value
 
-		return False
+class ThrottledUpdaterMixin:
+	# Throttling mechanism to avoid a queue build-up on the device when the user is dragging a slider in the UI.
+	# Used for dimming tasks. The dispatched task should exit quietly
+	# if the value it is passed is not the desired value anymore by the time the runner wakes up.
+	async def throttled_updater(self, update_task, item, value):
+		async with self._throttling_lock:
+			self._desired_value = value
+			task = asyncio.create_task(self._throttled_updater_runner(update_task, item, value))
+			background_tasks.add(task)
+			task.add_done_callback(background_tasks.discard)
 
-	def _handle_changed_setting(self, path, oldvalue, newvalue):
-		if path == 'customname':
-			self._dbusService['/CustomName'] = newvalue
-			return True
-		return False
+	async def _throttled_updater_runner(self, update_task, item, value):
+		# Only start one updater at a time
+		async with self._throttling_runner_lock:
+			# If a new dimming setpoint has been set by the time this thread wakes up, then exit this one.
+			async with self._throttling_lock:
+				if value != self._desired_value:
+					return
+			await update_task(item, value)
 
-	def _create_settings(self, *args, **kwargs):
-		bus = dbus.Bus.get_session(private=True) if 'DBUS_SESSION_BUS_ADDRESS' \
-				in os.environ else dbus.Bus.get_system(private=True)
-		return SettingsDevice(bus, *args, timeout=10, **kwargs)
-
-	def _create_dbus_service(self):
-		bus = dbus.Bus.get_session(private=True) if 'DBUS_SESSION_BUS_ADDRESS' \
-				in os.environ else dbus.Bus.get_system(private=True)
-
-		dbusService = VeDbusService(self._serviceName, bus=bus, register=False)
-		dbusService.add_mandatory_paths(
-			processname=sys.argv[0],
-			processversion=VERSION,
-			connection=self._interface,
-			deviceinstance=int(self._settings['deviceinstance'].split(':')[-1]),
-			productid=self._productId,
-			productname=self._productName,
-			firmwareversion=VERSION,
-			hardwareversion=None,
-			connected=1)
-		return dbusService
-
-	def terminate(self, signum, frame):
-		os._exit(0)
-
-class GxIoExtender(SwitchingDevice):
-	_productName = 'GX IO extender 150'
-	_write_dimming_timer = None
-	def __init__(self, serial):
-		self._config_file = "/run/io-ext/{}/pins.conf".format(serial)
-		self._check_config()
+class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
+	def __init__(self, bus_type, serial):
 		self._serial = serial
-		self.pins = self.parse_config(self._config_file)
+		self._throttling_lock = asyncio.Lock()
+		self._throttling_runner_lock = asyncio.Lock()
+		self._write_dimming_timer = None
+		self._write_dimming_task = None
+		self.bus_type = bus_type
+		self._productId = PRODUCT_ID
+		self._interface = "USB"
+		self._productNameSettings = 'gxio_%s' % self._serial
+		self._serviceName = 'com.victronenergy.switch.%s' % self._serial
+		self._productName = 'GX IO extender 150'
+		self._dbusService = None
+		self._settings = None
+		self.paths = []
 
-		for pin in self.pins:
-			output_type = pin.output_type
-			channel = pin.name
+	async def ainit(self):
+		config_file = "/run/io-ext/{}/pins.conf".format(self._serial)
+		if not os.path.exists(config_file):
+			raise FileNotFoundError("Configuration file not found: {}".format(config_file))
 
-			self.add_output(channel, output_type,
-				   partial(self.set_hw_state, pin, 'State_%s' % channel),
+		self.pins = self.parse_config(config_file)
+
+		self.bus = await MessageBus(bus_type=self.bus_type).connect()
+		self._settings = await wait_for_settings(self.bus, itemsChanged=self._handle_changed_setting)
+
+		# Obtain the class and vrm instance from localsettings
+		await self._settings.add_settings(Setting(f"/Settings/Devices/{self._productNameSettings}/ClassAndVrmInstance", "switch:50", alias="deviceinstance"),
+			Setting(f"/Settings/Devices/{self._productNameSettings}/CustomName", "", alias="customname"))
+
+		# Generic module paths
+		self.paths.append(TextItem('/Mgmt/ProcessName', sys.argv[0]))
+		self.paths.append(TextItem('/Mgmt/ProcessVersion', VERSION))
+		self.paths.append(TextItem('/Mgmt/Connection', self._interface))
+		self.paths.append(IntegerItem('/ProductId', self._productId, text=fmt['productid']))
+		self.paths.append(TextItem('/ProductName', self._productName))
+		self.paths.append(IntegerItem('/Connected', 1))
+		self.paths.append(TextItem('/Serial', self._serial))
+		self.paths.append(TextItem('/CustomName', self._settings.get_value(self._settings.alias('customname')), writeable=True, onchange=partial(self._handle_changed_value, '/CustomName')))
+		self.paths.append(IntegerItem('/State', ModuleState.CONNECTED, writeable=False, text=self._module_state_text_callback))
+		self.paths.append(IntegerItem('/DeviceInstance', int(self._settings.get_value(self._settings.alias('deviceinstance')).split(':')[-1])))
+
+		# Add outputs
+		await asyncio.gather(*(self.add_output(pin.name, pin.output_type,
+				   partial(self.set_hw_state, pin, 'State_%s' % pin.name),
 				   name=pin.label,
 				   set_dimming_cb=
-				   partial(self.set_dimming, pin, 'Dimming_%s' % channel) if output_type == OUTPUT_TYPE_DIMMABLE else None)
+				   partial(self.throttled_updater, partial(self.set_dimming, pin)) if pin.output_type == OutputType.DIMMABLE else None,
+				   initial_state=None if pin.store_state else pin.state) for pin in self.pins))
 
-			self.settings['Group_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Group' % (self._serial, channel), '', '', '']
-			self.settings['CustomName_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/CustomName' % (self._serial, channel), '', '', '']
-			self.settings['ShowUIControl_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/ShowUIControl' % (self._serial, channel), 1, 0, 6]
-			self.settings['Type_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Type' % (self._serial, channel), output_type, 0, 2]
-			# No setting for function, as it can only be manual.
-			if pin.store_state:
-				self.settings['State_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/State' % (self._serial, channel), 0, 0, 1]
-
-			if output_type == OUTPUT_TYPE_DIMMABLE:
-				self.settings['Dimming_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Dimming' % (self._serial, channel), 0, 0, 255]
-
-		super(GxIoExtender, self).__init__(PRODUCT_ID, tty=serial, interface="USB", serial=serial)
-
+		# Set initial pin state
 		for pin in self.pins:
-			channel = pin.name
-			# Set the initial state
 			if pin.store_state:
-				if pin.output_type == OUTPUT_TYPE_DIMMABLE:
-					self._dbusService['/SwitchableOutput/%s/Dimming' % channel] = self._settings['Dimming_%s' % channel]
-					pin.dimming = self._settings['Dimming_%s' % channel]
-				self._dbusService['/SwitchableOutput/%s/State' % channel] = self._settings['State_%s' % channel]
-				pin.state = self._settings['State_%s' % channel]
+				if pin.output_type == OutputType.DIMMABLE:
+					pin.dimming = self._settings.get_value(self._settings.alias(f'Dimming_{pin.name}'))
+				pin.state = self._settings.get_value(self._settings.alias(f'State_{pin.name}'))
 			else:
-				self._dbusService['/SwitchableOutput/%s/State' % channel] = pin.state
-			self._dbusService['/SwitchableOutput/%s/Status' % channel] = pin.status
-			self._dbusService['/SwitchableOutput/%s/Settings/CustomName' % channel] = self._settings['CustomName_%s' % channel]
-			self._dbusService['/SwitchableOutput/%s/Settings/Group' % channel] = self._settings['Group_%s' % channel]
-			self._dbusService['/SwitchableOutput/%s/Settings/ShowUIControl' % channel] = self._settings['ShowUIControl_%s' % channel]
-			self._dbusService['/SwitchableOutput/%s/Settings/Type' % channel] = self._settings['Type_%s' % channel]
+				pin.state = pin.state # Trigger status update
 
-	def terminate(self, signum, frame):
+		# Create the D-Bus service
+		self._dbusService = Service(self.bus, self._serviceName)
+
+		# Add all paths to the service
+		for path in self.paths:
+			self._dbusService.add_item(path)
+
+		# Register on dbus
+		await self._dbusService.register()
+
+	def _module_state_text_callback(self, value):
+		state_map = {
+			ModuleState.CONNECTED: "Connected",
+			ModuleState.OVER_TEMPERATURE: "Over temperature",
+			ModuleState.TEMPERATURE_WARNING: "Temperature warning",
+			ModuleState.CHANNEL_FAULT: "Channel fault",
+			ModuleState.CHANNEL_TRIPPED: "Channel tripped",
+			ModuleState.UNDER_VOLTAGE: "Under voltage",
+		}
+		return state_map.get(value, "Unknown")
+
+	async def stop(self):
 		if self._write_dimming_timer:
-			GLib.source_remove(self._write_dimming_timer)
-			self._write_dimming()
-		return super().terminate(signum, frame)
+			self._write_dimming_timer.cancel()
+		if self._write_dimming_task or self._write_dimming_timer:
+			await self._write_dimming()
+		self._write_dimming_timer = None
+		self._write_dimming_task = None
 
-	def _check_config(self):
-		if os.path.exists(self._config_file):
-			return True
-		self.terminate(None, None)
-		return
+		if self._dbusService:
+			await self._dbusService.close()
+
+		if self.bus:
+			self.bus.disconnect()
+
+	def _handle_changed_setting(self, service, values):
+		for p, v in values.items():
+			setting = p.split('/')[-1]
+			newvalue = v
+			if setting == 'CustomName':
+				with self._dbusService as s:
+					s['/CustomName'] = newvalue
 
 	def status_cb(self, pin):
 		if self._dbusService:
-			self._dbusService['/SwitchableOutput/%s/Status' % pin.name] = pin.status
+			with self._dbusService as s:
+				s['/SwitchableOutput/%s/Status' % pin.name] = pin.status
 
-	def set_hw_state(self, pin, setting, path, state):
-		pin.state = state
+	async def set_hw_state(self, pin, setting, item, value):
+		if value < 0 or value > 1:
+			return
+		pin.state = value
 		if pin.store_state:
-			self._settings[setting] = pin.state
-		return True
+			await self._settings.set_value(self._settings.alias(setting), pin.state)
+		item.set_local_value(value)
 
-	def set_dimming(self, pin, setting, path, state):
-		if state < 0 or state > 100:
+	async def set_dimming(self, pin, item, value):
+		if value < 0 or value > 100:
 			return False
-		pin.dimming = state
+		pin.dimming = value
 		# Throttle writing the dimming state to localsettings.
 		if self._write_dimming_timer:
-			GLib.source_remove(self._write_dimming_timer)
+			self._write_dimming_timer.cancel()
 			self._write_dimming_timer = None
-		self._write_dimming_timer = GLib.timeout_add_seconds(1, self._write_dimming)
-		return True
+		loop = asyncio.get_running_loop()
 
-	def _write_dimming(self):
-		for pin in [p for p in self.pins if p.output_type == OUTPUT_TYPE_DIMMABLE]:
-			if pin.dimming != self._settings['Dimming_%s' % pin.name]:
-				self._settings['Dimming_%s' % pin.name] = pin.dimming
+		self._write_dimming_timer = loop.call_later(1, self._start_write_dimming)
+		item.set_local_value(value)
+
+	def _start_write_dimming(self):
+			self._write_dimming_task = asyncio.create_task(self._write_dimming())
+			self._write_dimming_task.add_done_callback(self._clear_write_dimming_task)
+
+	def _clear_write_dimming_task(self, task):
+		if self._write_dimming_task is task:
+			self._write_dimming_task = None
+
+	async def _write_dimming(self):
+		for pin in [p for p in self.pins if p.output_type == OutputType.DIMMABLE]:
+			if pin.dimming != self._settings.get_value(self._settings.alias(f'Dimming_{pin.name}')):
+				await self._settings.set_value(
+					self._settings.alias(f'Dimming_{pin.name}'), pin.dimming)
 		self._write_dimming_timer = None
-		return False
 
-	def _handle_changed_value(self, path, value):
-		if path.endswith('/Type'):
-			validTypesPath = path.replace('/Type', '/ValidTypes')
-			if not ((1 << value) & self._dbusService[validTypesPath]):
-				return False
+	async def _handle_changed_value(self, path, item, value):
+		if path.endswith('/CustomName'):
+			if await self._settings.set_value(self._settings.alias('customname'), value) < 0:
+				return
 
-			if int(value) == OUTPUT_TYPE_MOMENTARY:
-				# Reset the state when the momentary type is selected
-				self._dbusService[path.replace('/Settings/Type', '/State')] = 0
-				# Call value changed directly to enforce the callback being called.
-				self._dbusService._value_changed(
-					'/SwitchableOutput/%s/State' % path.split('/')[-3], 0)
+		else:
+			if path.endswith('/Type'):
+				validTypesPath = path.replace('/Type', '/ValidTypes')
+				if not ((1 << value) & self._dbusService[validTypesPath]):
+					return
 
-		elif path.endswith('/Function'):
-			validFunctionsPath = path.replace('/Function', '/ValidFunctions')
-			if not ((1 << value) & self._dbusService[validFunctionsPath]):
-				return False
+				if int(value) == OutputType.MOMENTARY:
+					# Reset the state when the momentary type is selected
+					state_item = self._dbusService.get_item(path.replace('/Settings/Type', '/State'))
+					if state_item:
+						state_item._set_value(0)
 
-		split = path.split('/')
-		if len(split) > 3 and split[3] == 'Settings':
-			setting = split[-1] + '_' + split[-3]
-			try:
-				self._settings[setting] = value
-			except KeyError:
-				return False
-			return True
+			elif path.endswith('/Function'):
+				validFunctionsPath = path.replace('/Function', '/ValidFunctions')
+				if not ((1 << value) & self._dbusService[validFunctionsPath]):
+					return
 
-		return super(GxIoExtender, self)._handle_changed_value(path, value)
+			split = path.split('/')
+			if len(split) > 3 and split[3] == 'Settings':
+				setting = split[-1] + '_' + split[-3]
+				try:
+					if await self._settings.set_value(self._settings.alias(setting), value) < 0:
+						return
+				except KeyError:
+					return
+			else:
+				return
+
+		item.set_local_value(value)
 
 	def parse_config(self, conf):
 		f = open(conf)
@@ -593,21 +628,40 @@ class GxIoExtender(SwitchingDevice):
 if __name__ == '__main__':
 	parser = ArgumentParser(description=sys.argv[0])
 	parser.add_argument('-s', '--serial', default=None, help='serial number')
+	parser.add_argument('--dbus', help='dbus bus to use, defaults to system',
+			default='system')
 	parser.add_argument('-d', '--debug', help='set logging level to debug',
 						action='store_true')
 	args = parser.parse_args()
 
+	bus_type = {
+		"system": BusType.SYSTEM,
+		"session": BusType.SESSION
+	}.get(args.dbus, BusType.SESSION)
+
 	print('-------- dbus-switch, v' + VERSION + ' is starting up --------')
 
-	logger = setup_logging(args.debug)
+	logging.basicConfig(format='%(levelname)-8s %(message)s',
+		level=(logging.DEBUG if args.debug else logging.INFO))
 
-	# Have a mainloop, so we can send/receive asynchronous calls to and from dbus
-	DBusGMainLoop(set_as_default=True)
+	mainloop = asyncio.new_event_loop()
 
-	ioExtender = GxIoExtender(args.serial)
-	signal.signal(signal.SIGTERM, ioExtender.terminate)
-	signal.signal(signal.SIGINT, ioExtender.terminate)
+	def stop_mainloop():
+		mainloop.stop()
 
-	# Start and run the mainloop
-	mainloop = GLib.MainLoop()
-	mainloop.run()
+	mainloop.add_signal_handler(signal.SIGTERM, stop_mainloop)
+	mainloop.add_signal_handler(signal.SIGINT, stop_mainloop)
+
+	asyncio.set_event_loop(mainloop)
+	ioExtender = GxIoExtender(bus_type, args.serial)
+
+	try:
+		mainloop.run_until_complete(ioExtender.ainit())
+		logger.info("Starting main loop")
+		mainloop.run_forever()
+	finally:
+		mainloop.run_until_complete(ioExtender.stop())
+		mainloop.stop()
+		mainloop.close()
+
+	sys.exit()
