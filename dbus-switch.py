@@ -63,17 +63,11 @@ background_tasks = set()
 
 # Base class for all output types
 class Pin():
-	output_type = None
-	name = None
-	path = None
-	label = None
-	_status_cb = None
-	_fb = None
-	store_state = True
-	_state = 0
-	_status = STATUS_DISABLED
-
 	def __init__(self, name=None, path=None, label=None, fb = None, status_cb=None):
+		self._output_type = None
+		self.store_state = True
+		self._state = 0
+		self._status = STATUS_DISABLED
 		self.name = name
 		self.path = path
 		self.label = label
@@ -134,9 +128,10 @@ class Pin():
 			return BiStableRelay(name, set, res, label, fb, status_cb)
 
 class PwmPin(Pin):
-	output_type = OutputType.DIMMABLE
-	_dimming = 0
-	_state = 0
+	def __init__(self, name=None, path=None, label=None, fb=None, status_cb=None):
+		super(PwmPin, self).__init__(name=name, path=path, label=label, fb=fb, status_cb=status_cb)
+		self.output_type = OutputType.DIMMABLE
+		self._dimming = 0
 
 	@property
 	def dimming(self):
@@ -163,7 +158,9 @@ class PwmPin(Pin):
 		self.status = STATUS_ON if state else STATUS_OFF
 
 class OutputPin(Pin):
-	output_type = OutputType.TOGGLE
+	def __init__(self, name=None, path=None, label=None, fb=None, status_cb=None):
+		super(OutputPin, self).__init__(name=name, path=path, label=label, fb=fb, status_cb=status_cb)
+		self.output_type = OutputType.TOGGLE
 
 	@Pin.state.setter
 	def state(self, state):
@@ -181,15 +178,15 @@ class OutputPin(Pin):
 		self.status = STATUS_ON if state else STATUS_OFF
 
 class BiStableRelay(Pin):
-	output_type = OutputType.TOGGLE
 	PULSELEN = 2000
 	CHECK_INT = 100
-	retries = 0
-	desired_state = 0
 	def __init__(self, name=None, set=None, res=None, label=None, fb=None, status_cb=None):
 		super(BiStableRelay, self).__init__(name=name, label=label, fb=fb, status_cb=status_cb)
+		self.output_type = OutputType.TOGGLE
 		self.setpath = set
 		self.respath = res
+		self.retries = 0
+		self.desired_state = 0
 		self._state = self.fb_state
 		self._pins_lock = threading.Lock()	# Lock for accessing the HW pins
 		self._state_lock = threading.Lock()	# Lock for accessing _state
@@ -280,17 +277,22 @@ class BiStableRelay(Pin):
 
 # Base class for all switching devices.
 class SwitchableOutputMixin(object):
-	async def add_output(self, channel, output_type, set_state_cb, name=None, set_dimming_cb=None, store_state=False, initial_state=None):
+	async def add_output(self, pin, set_state_cb, name=None, set_dimming_cb=None, store_state=False, initial_state=None):
+		channel = pin.name
+		default_type = pin.output_type
 		path_base  = '/SwitchableOutput/%s/' % channel
 
 		# Make settings
 		await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Group", "", alias=f"Group_{channel}"),
 			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/CustomName", "", alias=f"CustomName_{channel}"),
 			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/ShowUIControl", 1, 0, 6, alias=f"ShowUIControl_{channel}"),
-			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Type", output_type, 0, 2, alias=f"Type_{channel}"))
+			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Type", default_type, 0, 2, alias=f"Type_{channel}"))
 		# No setting for function, as it can only be manual.
 		if initial_state is None:	# State setting needed if no initial state provided
 			await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/State", 0, 0, 1, alias=f"State_{channel}"))
+
+		output_type = OutputType(self._settings.get_value(self._settings.alias(f'Type_{channel}')))
+		pin.output_type = output_type
 
 		if output_type == OutputType.DIMMABLE:
 			await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Dimming", 0, 0, 255, alias=f"Dimming_{channel}"))
@@ -308,15 +310,15 @@ class SwitchableOutputMixin(object):
 		validTypesToggle = 1 << OutputType.TOGGLE
 		validTypesMomentary = 1 << OutputType.MOMENTARY
 
-		self.paths.append(TextItem(path_base + 'Settings/Group', "", writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/Group')))
-		self.paths.append(TextItem(path_base + 'Settings/CustomName', "", writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/CustomName')))
-		self.paths.append(IntegerItem(path_base + 'Settings/ShowUIControl', 1, writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/ShowUIControl')))
-		self.paths.append(IntegerItem(path_base + 'Settings/Type', output_type, writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/Type'),
+		self.paths.append(TextItem(path_base + 'Settings/Group', self._settings.get_value(self._settings.alias(f'Group_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/Group')))
+		self.paths.append(TextItem(path_base + 'Settings/CustomName', self._settings.get_value(self._settings.alias(f'CustomName_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/CustomName')))
+		self.paths.append(IntegerItem(path_base + 'Settings/ShowUIControl', self._settings.get_value(self._settings.alias(f'ShowUIControl_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/ShowUIControl')))
+		self.paths.append(IntegerItem(path_base + 'Settings/Type', output_type, writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/Type'),
 							text=self._type_text_callback))
 		self.paths.append(IntegerItem(path_base + 'Settings/ValidTypes', validTypesDimmable if
 							output_type == OutputType.DIMMABLE else validTypesToggle | validTypesMomentary,
 							writeable=False, text=self._valid_types_text_callback))
-		self.paths.append(IntegerItem(path_base + 'Settings/Function', OutputFunction.MANUAL, writeable=True, onchange=partial(self._handle_changed_value, path_base + 'Settings/Function'),
+		self.paths.append(IntegerItem(path_base + 'Settings/Function', OutputFunction.MANUAL, writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/Function'),
 							text=self._function_text_callback))
 		self.paths.append(IntegerItem(path_base + 'Settings/ValidFunctions', (1 << OutputFunction.MANUAL),
 							writeable=False, text=self._valid_functions_text_callback))
@@ -445,12 +447,12 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 		self.paths.append(TextItem('/ProductName', self._productName))
 		self.paths.append(IntegerItem('/Connected', 1))
 		self.paths.append(TextItem('/Serial', self._serial))
-		self.paths.append(TextItem('/CustomName', self._settings.get_value(self._settings.alias('customname')), writeable=True, onchange=partial(self._handle_changed_value, '/CustomName')))
+		self.paths.append(TextItem('/CustomName', self._settings.get_value(self._settings.alias('customname')), writeable=True, onchange=partial(self._set_customname)))
 		self.paths.append(IntegerItem('/State', ModuleState.CONNECTED, writeable=False, text=self._module_state_text_callback))
 		self.paths.append(IntegerItem('/DeviceInstance', int(self._settings.get_value(self._settings.alias('deviceinstance')).split(':')[-1])))
 
 		# Add outputs
-		await asyncio.gather(*(self.add_output(pin.name, pin.output_type,
+		await asyncio.gather(*(self.add_output(pin,
 				   partial(self.set_hw_state, pin, 'State_%s' % pin.name),
 				   name=pin.label,
 				   set_dimming_cb=
@@ -503,11 +505,9 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 
 	def _handle_changed_setting(self, service, values):
 		for p, v in values.items():
-			setting = p.split('/')[-1]
-			newvalue = v
-			if setting == 'CustomName':
+			if p == '/CustomName':
 				with self._dbusService as s:
-					s['/CustomName'] = newvalue
+					s['/CustomName'] = v
 
 	def status_cb(self, pin):
 		if self._dbusService:
@@ -518,9 +518,10 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 		if value < 0 or value > 1:
 			return
 		pin.state = value
-		if pin.store_state:
-			await self._settings.set_value(self._settings.alias(setting), pin.state)
 		item.set_local_value(value)
+		# No point in storing the state for momentary outputs as they should always start off.
+		if pin.store_state and pin.output_type != OutputType.MOMENTARY:
+			await self._settings.set_value(self._settings.alias(setting), pin.state)
 
 	async def set_dimming(self, pin, item, value):
 		if value < 0 or value > 100:
@@ -550,18 +551,21 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 					self._settings.alias(f'Dimming_{pin.name}'), pin.dimming)
 		self._write_dimming_timer = None
 
-	async def _handle_changed_value(self, path, item, value):
-		if path.endswith('/CustomName'):
-			if await self._settings.set_value(self._settings.alias('customname'), value) < 0:
-				return
+	async def _set_customname(self, item, value):
+		await self._settings.set_value(self._settings.alias('customname'), value)
+		item.set_local_value(value)
 
-		else:
+	async def _handle_changed_value(self, pin, path, item, value):
+		split = path.split('/')
+		if len(split) > 3 and split[3] == 'Settings':
 			if path.endswith('/Type'):
 				validTypesPath = path.replace('/Type', '/ValidTypes')
 				if not ((1 << value) & self._dbusService[validTypesPath]):
 					return
 
+				pin.output_type = OutputType(value)
 				if int(value) == OutputType.MOMENTARY:
+					await self._settings.set_value(self._settings.alias(f'State_{split[-3]}'), 0)
 					# Reset the state when the momentary type is selected
 					state_item = self._dbusService.get_item(path.replace('/Settings/Type', '/State'))
 					if state_item:
@@ -572,16 +576,14 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 				if not ((1 << value) & self._dbusService[validFunctionsPath]):
 					return
 
-			split = path.split('/')
-			if len(split) > 3 and split[3] == 'Settings':
-				setting = split[-1] + '_' + split[-3]
-				try:
-					if await self._settings.set_value(self._settings.alias(setting), value) < 0:
-						return
-				except KeyError:
+			setting = split[-1] + '_' + split[-3]
+			try:
+				if await self._settings.set_value(self._settings.alias(setting), value) < 0:
 					return
-			else:
+			except KeyError:
 				return
+		else:
+			return
 
 		item.set_local_value(value)
 
