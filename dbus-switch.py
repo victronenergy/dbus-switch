@@ -7,7 +7,6 @@ from argparse import ArgumentParser
 import traceback
 import logging
 from enum import IntEnum
-import threading
 import asyncio
 
 try:
@@ -61,268 +60,160 @@ STATUS_DISABLED = 0x20
 
 background_tasks = set()
 
-# Base class for all output types
+# Base class for all pins.
 class Pin():
-	def __init__(self, name=None, path=None, label=None, fb = None, status_cb=None):
+	@classmethod
+	def create(cls, service, settings, serial, cmd, arg):
+		pin = None
+		pth, id = arg.split(maxsplit=1)
+		if cmd == 'relay' or cmd == 'ssr':
+			name = "relay_" + id
+			label = ("Relay " if cmd == 'relay' else "Solid state relay ") + id
+
+			paths = []
+			for x in os.listdir(os.path.dirname(pth)):
+				if x.startswith(os.path.basename(pth)):
+					paths.append(os.path.join(os.path.dirname(pth), x))
+
+			fb_path = set_path = res_path = None
+			for path in paths:
+				fb_path = path if path.endswith('_in') else fb_path
+				res_path = path if path.endswith('_res') else res_path
+				set_path = path if path.endswith('_set') or path.endswith(str(id)) else set_path
+
+			if set_path and not res_path: # Monostable relay
+				pin = OutputPin(name, pth + '/value', label)
+			elif set_path and res_path: # Bistable relay
+				pin = BiStableRelay(name, set_path + '/value', res_path + '/value', label, fb_path + '/value' if fb_path else None)
+			else:
+				raise ValueError("Invalid relay configuration for pin id {}".format(id))
+
+		elif cmd == 'pwm':
+			name = "pwm_" + id
+			label = "PWM Output " + id
+			pin = PwmPin(name, pth, label)
+
+		elif cmd == 'output':
+			name = "output_" + id
+			label = "Output " + id
+			pin = OutputPin(name, pth + '/value', label)
+
+		elif cmd == 'input':
+			pass # Inputs are not supported yet.
+
+		else:
+			raise ValueError("Unknown pin type: {}".format(cmd))
+
+		pin.set_resources(service, settings, serial, f'/SwitchableOutput/{name}/')
+		return pin
+
+	def __init__(self, name=None, path=None, label=None):
 		self._output_type = None
-		self.store_state = True
+		self._valid_types = None
+		self._function = OutputFunction.MANUAL
+		self._valid_functions = (1 << OutputFunction.MANUAL)
+		self._store_state = True
 		self._state = 0
 		self._status = STATUS_DISABLED
 		self.name = name
 		self.path = path
 		self.label = label
-		self._fb = fb
-		self._status_cb = status_cb
 
-		if self._fb is not None:
-			self.store_state = False
+	def set_resources(self, service, settings, serial, path_base):
+		self._service = service
+		self._settings = settings
+		self._path_base = path_base
+		self._serial = serial
 
-	@property
-	def state(self):
-		return self._state
+	def types_to_mask(self, types):
+		mask = 0
+		for t in types:
+			mask |= (1 << t)
+		return mask
 
-	@state.setter
-	def state(self, state):
-		raise NotImplementedError
-
-	@property
-	def status(self):
-		return self._status
-
-	@status.setter
-	def status(self, status):
-		self._status = status
-		if self._status_cb is not None:
-			self._status_cb(self)
-
-	@property
-	def has_feedback(self):
-		return self._fb is not None
-
-	@property
-	def fb_state(self):
-		if self._fb:
-			try:
-				with open(self._fb + '/value', 'rt') as r:
-					return int(r.read())
-			except IOError:
-				traceback.print_exc()
-		raise ValueError("No feedback pin")
-
-	@classmethod
-	def createRelay(cls, id, name, paths, label, status_cb=None):
-		fb = None
-		set = None
-		res = None
-		for path in paths:
-			fb = path if path.endswith('_in') else fb
-			res = path if path.endswith('_res') else res
-			set = path if path.endswith('_set') or path.endswith(str(id)) else set
-
-		# Monostable relay
-		if set and not res:
-			return OutputPin(name, path + '/value', label, fb, status_cb)
-
-		# Bistable relay
-		if set and res:
-			return BiStableRelay(name, set, res, label, fb, status_cb)
-
-class PwmPin(Pin):
-	def __init__(self, name=None, path=None, label=None, fb=None, status_cb=None):
-		super(PwmPin, self).__init__(name=name, path=path, label=label, fb=fb, status_cb=status_cb)
-		self.output_type = OutputType.DIMMABLE
-		self._dimming = 0
-
-	@property
-	def dimming(self):
-		return self._dimming
-
-	@dimming.setter
-	def dimming(self, dimming):
-		self._dimming = dimming
-		if self._state:
-			self.state = 1
-
-	@Pin.state.setter
-	def state(self, state):
-		if state < 0 or state > 1:
-			return
-		try:
-			with open(self.path, 'wt') as w:
-				w.write(str(round(self._dimming * 2.55)) if state else '0')
-		except IOError:
-			traceback.print_exc()
-			return
-
-		self._state = state
-		self.status = STATUS_ON if state else STATUS_OFF
-
-class OutputPin(Pin):
-	def __init__(self, name=None, path=None, label=None, fb=None, status_cb=None):
-		super(OutputPin, self).__init__(name=name, path=path, label=label, fb=fb, status_cb=status_cb)
-		self.output_type = OutputType.TOGGLE
-
-	@Pin.state.setter
-	def state(self, state):
-		if state < 0 or state > 1:
-			return
-		try:
-			with open(self.path, 'wt') as w:
-				w.write(str(round(state)))
-		except IOError:
-			traceback.print_exc()
-			self.status = STATUS_OUTPUT_FAULT
-			return
-
-		self._state = state
-		self.status = STATUS_ON if state else STATUS_OFF
-
-class BiStableRelay(Pin):
-	PULSELEN = 2000
-	CHECK_INT = 100
-	def __init__(self, name=None, set=None, res=None, label=None, fb=None, status_cb=None):
-		super(BiStableRelay, self).__init__(name=name, label=label, fb=fb, status_cb=status_cb)
-		self.output_type = OutputType.TOGGLE
-		self.setpath = set
-		self.respath = res
-		self.retries = 0
-		self.desired_state = 0
-		self._state = self.fb_state
-		self._pins_lock = threading.Lock()	# Lock for accessing the HW pins
-		self._state_lock = threading.Lock()	# Lock for accessing _state
-		self._timer_task = None
-		self.status = STATUS_ON if self._state else STATUS_OFF
-		self._clear_paths()
-
-	@Pin.state.setter
-	def state(self, state):
-		with self._pins_lock:
-			try:
-				with open((self.setpath if state else self.respath) + '/value', 'wt') as w:
-					w.write('1')
-			except IOError:
-				traceback.print_exc()
-				return
-
-		self._cancel_timer()
-		if self.has_feedback:
-			self.retries = 0
-			self._timer_task = self._schedule_async(self._wait_for_state_async(state))
-		else:
-			self._timer_task = self._schedule_async(self._clear_after_pulse())
-			self.status = STATUS_ON if self._state else STATUS_OFF
-
-		with self._state_lock:
-			self._state = state
-
-	def _schedule_async(self, coro):
-		# Assumes this is called on the running asyncio loop thread.
-		return asyncio.get_running_loop().create_task(coro)
-
-	def _cancel_timer(self):
-		if self._timer_task and not self._timer_task.done():
-			self._timer_task.cancel()
-		self._timer_task = None
-
-	async def _clear_after_pulse(self):
-		try:
-			await asyncio.sleep(self.PULSELEN / 1000)
-			self.clear()
-		except asyncio.CancelledError:
-			return
-
-	async def _wait_for_state_async(self, state):
-		try:
-			while True:
-				if not self._waitForState(state):
-					return
-				await asyncio.sleep(self.CHECK_INT / 1000)
-		except asyncio.CancelledError:
-			return
-
-	def _waitForState(self, state):
-		with self._state_lock:
-			if self._state != state:
-				# State has changed while waiting.
-				# Only clear the path that was set to prevent breaking the next change.
-				with self._pins_lock:
-					with open((self.setpath if state else self.respath) + '/value', 'wt') as w:
-						w.write('0')
-				return False # Stop timer
-		self.retries += 1
-		ret = self.fb_state != state and self.retries < self.PULSELEN / self.CHECK_INT
-		if not ret:
-			self._clear()
-		return ret
-
-	def _clear(self):
-		if self.has_feedback:
-			with self._state_lock:
-				if self._state != self.fb_state:
-					self.status = STATUS_OUTPUT_FAULT
-				else:
-					self.status = STATUS_ON if self._state else STATUS_OFF
-		self._clear_paths()
-
-	def _clear_paths(self):
-		with self._pins_lock:
-			for path in [self.setpath, self.respath]:
-				try:
-					with open(path + '/value', 'wt') as w:
-						w.write('0')
-				except IOError:
-					traceback.print_exc()
-					return False
-			return True
-
-# Base class for all switching devices.
-class SwitchableOutputMixin(object):
-	async def add_output(self, pin, set_state_cb, name=None, set_dimming_cb=None, store_state=False, initial_state=None):
-		channel = pin.name
-		default_type = pin.output_type
-		path_base  = '/SwitchableOutput/%s/' % channel
-
+	async def ainit(self):
+		if self._service is None or self._settings is None:
+			raise RuntimeError("Pin resources not set")
+		channel = self.name
 		# Make settings
 		await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Group", "", alias=f"Group_{channel}"),
 			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/CustomName", "", alias=f"CustomName_{channel}"),
 			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/ShowUIControl", 1, 0, 6, alias=f"ShowUIControl_{channel}"),
-			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Type", default_type, 0, 2, alias=f"Type_{channel}"))
-		# No setting for function, as it can only be manual.
-		if initial_state is None:	# State setting needed if no initial state provided
-			await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/State", 0, 0, 1, alias=f"State_{channel}"))
+			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Type", self._output_type, 0, 2, alias=f"Type_{channel}"))
 
-		output_type = OutputType(self._settings.get_value(self._settings.alias(f'Type_{channel}')))
-		pin.output_type = output_type
+		self._output_type = self._settings.get_value(self._settings.alias(f'Type_{channel}'))
 
-		if output_type == OutputType.DIMMABLE:
-			await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Dimming", 0, 0, 255, alias=f"Dimming_{channel}"))
+		# Generic channel paths
+		self._service.add_item(TextItem(self._path_base + 'Settings/Group', self._settings.get_value(self._settings.alias(f'Group_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/Group')))
+		self._service.add_item(TextItem(self._path_base + 'Settings/CustomName', self._settings.get_value(self._settings.alias(f'CustomName_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/CustomName')))
+		self._service.add_item(IntegerItem(self._path_base + 'Settings/ShowUIControl', self._settings.get_value(self._settings.alias(f'ShowUIControl_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/ShowUIControl')))
+		self._service.add_item(TextItem(self._path_base + 'Name', self.label, writeable=False))
 
-		init_state = initial_state if initial_state is not None else self._settings.get_value(self._settings.alias(f'State_{channel}'))
-		self.paths.append(IntegerItem(path_base + 'State', init_state, writeable=True, onchange=set_state_cb))
-		self.paths.append(IntegerItem(path_base + 'Status', STATUS_ON if init_state else STATUS_OFF, writeable=False, text=self._status_text_callback))
-		self.paths.append(TextItem(path_base + 'Name', name, writeable=False))
-
-		if output_type == OutputType.DIMMABLE:
-			self.paths.append(IntegerItem(path_base + "Dimming", self._settings.get_value(self._settings.alias(f'Dimming_{channel}')), writeable=True, onchange=set_dimming_cb, text=lambda y: str(y) + '%'))
-
-		# Settings
-		validTypesDimmable = 1 << OutputType.DIMMABLE
-		validTypesToggle = 1 << OutputType.TOGGLE
-		validTypesMomentary = 1 << OutputType.MOMENTARY
-
-		self.paths.append(TextItem(path_base + 'Settings/Group', self._settings.get_value(self._settings.alias(f'Group_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/Group')))
-		self.paths.append(TextItem(path_base + 'Settings/CustomName', self._settings.get_value(self._settings.alias(f'CustomName_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/CustomName')))
-		self.paths.append(IntegerItem(path_base + 'Settings/ShowUIControl', self._settings.get_value(self._settings.alias(f'ShowUIControl_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/ShowUIControl')))
-		self.paths.append(IntegerItem(path_base + 'Settings/Type', output_type, writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/Type'),
+		self._service.add_item(IntegerItem(self._path_base + 'Settings/Type', self._output_type, writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/Type'),
 							text=self._type_text_callback))
-		self.paths.append(IntegerItem(path_base + 'Settings/ValidTypes', validTypesDimmable if
-							output_type == OutputType.DIMMABLE else validTypesToggle | validTypesMomentary,
-							writeable=False, text=self._valid_types_text_callback))
-		self.paths.append(IntegerItem(path_base + 'Settings/Function', OutputFunction.MANUAL, writeable=True, onchange=partial(self._handle_changed_value, pin, path_base + 'Settings/Function'),
+		self._service.add_item(IntegerItem(self._path_base + 'Settings/ValidTypes', self._valid_types, writeable=False, text=self._valid_types_text_callback))
+		self._service.add_item(IntegerItem(self._path_base + 'Settings/Function', OutputFunction.MANUAL, writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/Function'),
 							text=self._function_text_callback))
-		self.paths.append(IntegerItem(path_base + 'Settings/ValidFunctions', (1 << OutputFunction.MANUAL),
+		self._service.add_item(IntegerItem(self._path_base + 'Settings/ValidFunctions', (1 << OutputFunction.MANUAL),
 							writeable=False, text=self._valid_functions_text_callback))
 
+	async def stop(self):
+		pass
+
+	def write(self, path, value):
+		try:
+			with open(path, "wt") as w:
+				w.write(str(value))
+			return True
+		except IOError:
+			traceback.print_exc()
+			return False
+
+	def read(self, path):
+		try:
+			with open(path, "rt") as r:
+				return int(r.read())
+		except IOError:
+			traceback.print_exc()
+			return None
+
+	async def _handle_changed_value(self, path, item, value):
+		split = path.split('/')
+		if len(split) > 3 and split[3] == 'Settings':
+			if path.endswith('/Type'):
+				validTypesPath = path.replace('/Type', '/ValidTypes')
+				if not ((1 << value) & self._service[validTypesPath]):
+					return
+
+				self.output_type = OutputType(value)
+				if int(value) == OutputType.MOMENTARY:
+					if self._store_state:
+						await self._settings.set_value(self._settings.alias(f'State_{split[-3]}'), 0)
+					# Reset the state when the momentary type is selected
+					state_item = self._service.get_item(path.replace('/Settings/Type', '/State'))
+					if state_item:
+						state_item._set_value(0)
+
+			elif path.endswith('/Function'):
+				validFunctionsPath = path.replace('/Function', '/ValidFunctions')
+				if not ((1 << value) & self._service[validFunctionsPath]):
+					return
+
+			setting = split[-1] + '_' + split[-3]
+			try:
+				if await self._settings.set_value(self._settings.alias(setting), value) < 0:
+					return
+			except KeyError:
+				return
+		else:
+			return
+
+		item.set_local_value(value)
+
+	async def set_hw_state(self, state):
+		raise NotImplementedError
+
+	# Formatters
 	def _status_text_callback(self, value):
 		status_map = {
 			0x00: "Off",
@@ -387,34 +278,227 @@ class SwitchableOutputMixin(object):
 		]
 		return self._bitmask_text(value, entries)
 
+class OutputPin(Pin):
+	def __init__(self, name=None, path=None, label=None):
+		super(OutputPin, self).__init__(name=name, path=path, label=label)
+		self._output_type = OutputType.TOGGLE
+		self._valid_types = self.types_to_mask([OutputType.MOMENTARY, OutputType.TOGGLE])
 
-class ThrottledUpdaterMixin:
-	# Throttling mechanism to avoid a queue build-up on the device when the user is dragging a slider in the UI.
-	# Used for dimming tasks. The dispatched task should exit quietly
-	# if the value it is passed is not the desired value anymore by the time the runner wakes up.
-	async def throttled_updater(self, update_task, item, value):
-		async with self._throttling_lock:
-			self._desired_value = value
-			task = asyncio.create_task(self._throttled_updater_runner(update_task, item, value))
-			background_tasks.add(task)
-			task.add_done_callback(background_tasks.discard)
+	async def ainit(self):
+		await super().ainit()
 
-	async def _throttled_updater_runner(self, update_task, item, value):
-		# Only start one updater at a time
-		async with self._throttling_runner_lock:
-			# If a new dimming setpoint has been set by the time this thread wakes up, then exit this one.
-			async with self._throttling_lock:
-				if value != self._desired_value:
-					return
-			await update_task(item, value)
+		# Fetch type from settings
+		self._output_type = OutputType(self._settings.get_value(self._settings.alias(f'Type_{self.name}')))
 
-class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
-	def __init__(self, bus_type, serial):
-		self._serial = serial
-		self._throttling_lock = asyncio.Lock()
-		self._throttling_runner_lock = asyncio.Lock()
+		if self._store_state:
+			await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{self.name}/State", 0, 0, 1, alias=f"State_{self.name}"))
+			self._state = self._settings.get_value(self._settings.alias(f'State_{self.name}'))
+
+		self._service.add_item(IntegerItem(self._path_base + 'State', self._state, writeable=True, onchange=self.set_state))
+		self._service.add_item(IntegerItem(self._path_base + 'Status', STATUS_ON if self._state else STATUS_OFF, writeable=False, text=self._status_text_callback))
+
+		# Set initial state
+		if self._store_state:
+			await self.set_hw_state(self._settings.get_value(self._settings.alias(f'State_{self.name}')))
+
+	def set_status(self, status):
+		self._status = status
+		if self._service:
+			with self._service as s:
+				s[f'{self._path_base}Status'] = self._status
+
+	async def set_state(self, item, value):
+		if value < 0 or value > 1:
+			return
+		await self.set_hw_state(value)
+		item.set_local_value(value)
+		# No point in storing the state for momentary outputs as they should always start off.
+		if self._store_state and self._output_type != OutputType.MOMENTARY:
+			await self._settings.set_value(self._settings.alias(f'State_{self.name}'), self._state)
+
+	async def set_hw_state(self, state):
+		if state < 0 or state > 1:
+			return
+		if not self.write(self.path, str(round(state))):
+			return
+
+		self._state = state
+		self.set_status(STATUS_ON if state else STATUS_OFF)
+
+class PwmPin(OutputPin):
+	def __init__(self, name=None, path=None, label=None):
+		super(PwmPin, self).__init__(name=name, path=path, label=label)
+		self._output_type = OutputType.DIMMABLE
+		self._valid_types = self.types_to_mask([OutputType.DIMMABLE])
+		self._dimming = 0
 		self._write_dimming_timer = None
 		self._write_dimming_task = None
+
+	async def ainit(self):
+		await super().ainit()
+
+		await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{self.name}/Dimming", 0, 0, 100, alias=f"Dimming_{self.name}"))
+		init_dimming = self._settings.get_value(self._settings.alias(f'Dimming_{self.name}'))
+		self._service.add_item(IntegerItem(self._path_base + "Dimming", init_dimming, writeable=True, onchange=self.set_dimming, text=lambda y: str(y) + '%'))
+
+		# Set initial state
+		item = self._service.get_item(self._path_base + "Dimming")
+		if item:
+			self.set_dimming(item, init_dimming)
+
+	async def stop(self):
+		if self._write_dimming_timer:
+			self._write_dimming_timer.cancel()
+		if self._write_dimming_task or self._write_dimming_timer:
+			await self._write_dimming()
+		self._write_dimming_timer = None
+		self._write_dimming_task = None
+
+	def set_dimming(self, value):
+		if value < 0 or value > 100:
+			return False
+		self._dimming = value
+		if self._state:
+			self.set_dimming_state(1)
+		# Throttle writing the dimming state to localsettings.
+		if self._write_dimming_timer:
+			self._write_dimming_timer.cancel()
+			self._write_dimming_timer = None
+		loop = asyncio.get_running_loop()
+
+		self._write_dimming_timer = loop.call_later(1, self._start_write_dimming)
+		return True
+
+	def _start_write_dimming(self):
+			self._write_dimming_task = asyncio.create_task(self._write_dimming())
+			self._write_dimming_task.add_done_callback(self._clear_write_dimming_task)
+
+	def _clear_write_dimming_task(self, task):
+		if self._write_dimming_task is task:
+			self._write_dimming_task = None
+
+	async def _write_dimming(self):
+		if self._dimming != self._settings.get_value(self._settings.alias(f'Dimming_{self.name}')):
+			await self._settings.set_value(self._settings.alias(f'Dimming_{self.name}'), self._dimming)
+		self._write_dimming_timer = None
+
+	async def set_state(self, item, value):
+		if value < 0 or value > 1:
+			return
+		self.set_dimming_state(value)
+		item.set_local_value(value)
+
+	def set_dimming_state(self, state):
+		if state < 0 or state > 1:
+			return
+		if not self.write(self.path, str(round(self._dimming * 2.55)) if state else '0'):
+			return
+
+		self._state = state
+		self.set_status(STATUS_ON if state else STATUS_OFF)
+
+
+class BiStableRelay(OutputPin):
+	PULSELEN = 1000 # milliseconds
+	CHECK_INT = 100 # milliseconds
+	def __init__(self, name=None, set_path=None, res_path=None, label=None, fb_path=None):
+		super(BiStableRelay, self).__init__(name=name, label=label)
+		self._output_type = OutputType.TOGGLE
+		self._valid_types = self.types_to_mask([OutputType.MOMENTARY, OutputType.TOGGLE])
+		self._setpath = set_path
+		self._respath = res_path
+		self._fb = fb_path
+		self._retries = 0
+		self._state_lock = asyncio.Lock()
+		self._timer_task = None
+
+		if self._fb is not None:
+			self._store_state = False
+
+	async def ainit(self):
+		if self._fb is not None:
+			self._state = self.fb_state_async()
+		await super().ainit()
+		self.set_status(STATUS_ON if self._state else STATUS_OFF)
+		self._clear_paths()
+
+	async def set_hw_state(self, state):
+		if not self.write(self._setpath if state else self._respath, '1'):
+			return
+
+		self._cancel_timer()
+		if self._fb is not None:
+			self._retries = 0
+			self._timer_task = self._schedule_async(self._wait_for_state_async(state))
+		else:
+			self._timer_task = self._schedule_async(self._clear_after_pulse())
+			self.set_status(STATUS_ON if self._state else STATUS_OFF)
+
+		async with self._state_lock:
+			self._state = state
+
+	def fb_state_async(self):
+		if self._fb:
+			return self.read(self._fb) or 0
+		return self._state
+
+	def _schedule_async(self, coro):
+		# Assumes this is called on the running asyncio loop thread.
+		return asyncio.get_running_loop().create_task(coro)
+
+	def _cancel_timer(self):
+		if self._timer_task and not self._timer_task.done():
+			self._timer_task.cancel()
+		self._timer_task = None
+
+	async def _clear_after_pulse(self):
+		try:
+			await asyncio.sleep(self.PULSELEN / 1000)
+			await self._clear_async(self._state)
+		except asyncio.CancelledError:
+			return
+
+	async def _wait_for_state_async(self, state):
+		try:
+			while True:
+				if not await self._wait_for_state(state):
+					return
+				await asyncio.sleep(self.CHECK_INT / 1000)
+		except asyncio.CancelledError:
+			# Clear the path that was set to prevent breaking the next change.
+			self.write(self._setpath if state else self._respath, '0')
+			return
+
+	async def _wait_for_state(self, state):
+		async with self._state_lock:
+			if self._state != state:
+				# State has changed while waiting.
+				# Only clear the path that was set to prevent breaking the next change.
+				self.write(self._setpath if state else self._respath, '0')
+				return False # Stop timer
+		self._retries += 1
+		fb_state = self.fb_state_async()
+		if fb_state == state or self._retries >= self.PULSELEN / self.CHECK_INT:
+			await self._clear_async(fb_state)
+			return False # Stop timer
+		return True # Continue timer
+
+	async def _clear_async(self, fb_state):
+		if self._fb is not None:
+			async with self._state_lock:
+				if self._state != fb_state:
+					self.set_status(STATUS_OUTPUT_FAULT)
+				else:
+					self.set_status(STATUS_ON if self._state else STATUS_OFF)
+		self._clear_paths()
+
+	def _clear_paths(self):
+		self.write(self._setpath, '0')
+		self.write(self._respath, '0')
+
+class GxIoExtender():
+	def __init__(self, bus_type, serial):
+		self._serial = serial
 		self.bus_type = bus_type
 		self._productId = PRODUCT_ID
 		self._interface = "USB"
@@ -423,57 +507,39 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 		self._productName = 'GX IO extender 150'
 		self._dbusService = None
 		self._settings = None
-		self.paths = []
 
 	async def ainit(self):
 		config_file = "/run/io-ext/{}/pins.conf".format(self._serial)
 		if not os.path.exists(config_file):
 			raise FileNotFoundError("Configuration file not found: {}".format(config_file))
 
-		self.pins = self.parse_config(config_file)
-
 		self.bus = await MessageBus(bus_type=self.bus_type).connect()
 		self._settings = await wait_for_settings(self.bus, itemsChanged=self._handle_changed_setting)
+
+		# Create the D-Bus service
+		self._dbusService = Service(self.bus, self._serviceName)
 
 		# Obtain the class and vrm instance from localsettings
 		await self._settings.add_settings(Setting(f"/Settings/Devices/{self._productNameSettings}/ClassAndVrmInstance", "switch:50", alias="deviceinstance"),
 			Setting(f"/Settings/Devices/{self._productNameSettings}/CustomName", "", alias="customname"))
 
 		# Generic module paths
-		self.paths.append(TextItem('/Mgmt/ProcessName', sys.argv[0]))
-		self.paths.append(TextItem('/Mgmt/ProcessVersion', VERSION))
-		self.paths.append(TextItem('/Mgmt/Connection', self._interface))
-		self.paths.append(IntegerItem('/ProductId', self._productId, text=fmt['productid']))
-		self.paths.append(TextItem('/ProductName', self._productName))
-		self.paths.append(IntegerItem('/Connected', 1))
-		self.paths.append(TextItem('/Serial', self._serial))
-		self.paths.append(TextItem('/CustomName', self._settings.get_value(self._settings.alias('customname')), writeable=True, onchange=partial(self._set_customname)))
-		self.paths.append(IntegerItem('/State', ModuleState.CONNECTED, writeable=False, text=self._module_state_text_callback))
-		self.paths.append(IntegerItem('/DeviceInstance', int(self._settings.get_value(self._settings.alias('deviceinstance')).split(':')[-1])))
+		self._dbusService.add_item(TextItem('/Mgmt/ProcessName', sys.argv[0]))
+		self._dbusService.add_item(TextItem('/Mgmt/ProcessVersion', VERSION))
+		self._dbusService.add_item(TextItem('/Mgmt/Connection', self._interface))
+		self._dbusService.add_item(IntegerItem('/ProductId', self._productId, text=fmt['productid']))
+		self._dbusService.add_item(TextItem('/ProductName', self._productName))
+		self._dbusService.add_item(IntegerItem('/Connected', 1))
+		self._dbusService.add_item(TextItem('/Serial', self._serial))
+		self._dbusService.add_item(TextItem('/CustomName', self._settings.get_value(self._settings.alias('customname')), writeable=True, onchange=partial(self._set_customname)))
+		self._dbusService.add_item(IntegerItem('/State', ModuleState.CONNECTED, writeable=False, text=self._module_state_text_callback))
+		self._dbusService.add_item(IntegerItem('/DeviceInstance', int(self._settings.get_value(self._settings.alias('deviceinstance')).split(':')[-1])))
 
-		# Add outputs
-		await asyncio.gather(*(self.add_output(pin,
-				   partial(self.set_hw_state, pin, 'State_%s' % pin.name),
-				   name=pin.label,
-				   set_dimming_cb=
-				   partial(self.throttled_updater, partial(self.set_dimming, pin)) if pin.output_type == OutputType.DIMMABLE else None,
-				   initial_state=None if pin.store_state else pin.state) for pin in self.pins))
-
-		# Set initial pin state
-		for pin in self.pins:
-			if pin.store_state:
-				if pin.output_type == OutputType.DIMMABLE:
-					pin.dimming = self._settings.get_value(self._settings.alias(f'Dimming_{pin.name}'))
-				pin.state = self._settings.get_value(self._settings.alias(f'State_{pin.name}'))
-			else:
-				pin.state = pin.state # Trigger status update
-
-		# Create the D-Bus service
-		self._dbusService = Service(self.bus, self._serviceName)
-
-		# Add all paths to the service
-		for path in self.paths:
-			self._dbusService.add_item(path)
+		self.pins = self.parse_config(config_file)
+		try:
+			await asyncio.gather(*(pin.ainit() for pin in self.pins), return_exceptions=True)
+		except Exception as e:
+			logger.error("Error initializing pins: {}".format(e))
 
 		# Register on dbus
 		await self._dbusService.register()
@@ -490,18 +556,17 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 		return state_map.get(value, "Unknown")
 
 	async def stop(self):
-		if self._write_dimming_timer:
-			self._write_dimming_timer.cancel()
-		if self._write_dimming_task or self._write_dimming_timer:
-			await self._write_dimming()
-		self._write_dimming_timer = None
-		self._write_dimming_task = None
+		try:
+			await asyncio.gather(*(pin.stop() for pin in self.pins), return_exceptions=True)
+		except Exception as e:
+			logger.error("Error stopping pins: {}".format(e))
 
 		if self._dbusService:
 			await self._dbusService.close()
 
 		if self.bus:
 			self.bus.disconnect()
+		return
 
 	def _handle_changed_setting(self, service, values):
 		for p, v in values.items():
@@ -509,82 +574,8 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 				with self._dbusService as s:
 					s['/CustomName'] = v
 
-	def status_cb(self, pin):
-		if self._dbusService:
-			with self._dbusService as s:
-				s['/SwitchableOutput/%s/Status' % pin.name] = pin.status
-
-	async def set_hw_state(self, pin, setting, item, value):
-		if value < 0 or value > 1:
-			return
-		pin.state = value
-		item.set_local_value(value)
-		# No point in storing the state for momentary outputs as they should always start off.
-		if pin.store_state and pin.output_type != OutputType.MOMENTARY:
-			await self._settings.set_value(self._settings.alias(setting), pin.state)
-
-	async def set_dimming(self, pin, item, value):
-		if value < 0 or value > 100:
-			return False
-		pin.dimming = value
-		# Throttle writing the dimming state to localsettings.
-		if self._write_dimming_timer:
-			self._write_dimming_timer.cancel()
-			self._write_dimming_timer = None
-		loop = asyncio.get_running_loop()
-
-		self._write_dimming_timer = loop.call_later(1, self._start_write_dimming)
-		item.set_local_value(value)
-
-	def _start_write_dimming(self):
-			self._write_dimming_task = asyncio.create_task(self._write_dimming())
-			self._write_dimming_task.add_done_callback(self._clear_write_dimming_task)
-
-	def _clear_write_dimming_task(self, task):
-		if self._write_dimming_task is task:
-			self._write_dimming_task = None
-
-	async def _write_dimming(self):
-		for pin in [p for p in self.pins if p.output_type == OutputType.DIMMABLE]:
-			if pin.dimming != self._settings.get_value(self._settings.alias(f'Dimming_{pin.name}')):
-				await self._settings.set_value(
-					self._settings.alias(f'Dimming_{pin.name}'), pin.dimming)
-		self._write_dimming_timer = None
-
 	async def _set_customname(self, item, value):
 		await self._settings.set_value(self._settings.alias('customname'), value)
-		item.set_local_value(value)
-
-	async def _handle_changed_value(self, pin, path, item, value):
-		split = path.split('/')
-		if len(split) > 3 and split[3] == 'Settings':
-			if path.endswith('/Type'):
-				validTypesPath = path.replace('/Type', '/ValidTypes')
-				if not ((1 << value) & self._dbusService[validTypesPath]):
-					return
-
-				pin.output_type = OutputType(value)
-				if int(value) == OutputType.MOMENTARY:
-					await self._settings.set_value(self._settings.alias(f'State_{split[-3]}'), 0)
-					# Reset the state when the momentary type is selected
-					state_item = self._dbusService.get_item(path.replace('/Settings/Type', '/State'))
-					if state_item:
-						state_item._set_value(0)
-
-			elif path.endswith('/Function'):
-				validFunctionsPath = path.replace('/Function', '/ValidFunctions')
-				if not ((1 << value) & self._dbusService[validFunctionsPath]):
-					return
-
-			setting = split[-1] + '_' + split[-3]
-			try:
-				if await self._settings.set_value(self._settings.alias(setting), value) < 0:
-					return
-			except KeyError:
-				return
-		else:
-			return
-
 		item.set_local_value(value)
 
 	def parse_config(self, conf):
@@ -592,38 +583,13 @@ class GxIoExtender(SwitchableOutputMixin, ThrottledUpdaterMixin):
 
 		pins = []
 		for line in f:
-			cmd, arg = line.strip().split(maxsplit=1)
-
-			if cmd == 'relay' or cmd == 'ssr':
-				pth, id = arg.split(maxsplit=1)
-				name = "relay_" + id
-				label = ("Relay " if cmd == 'relay' else "Solid state relay ") + id
-
-				pths = []
-				for x in os.listdir(os.path.dirname(pth)):
-					if x.startswith(os.path.basename(pth)):
-						pths.append(os.path.join(os.path.dirname(pth), x))
-				pin = Pin.createRelay(id, name, pths, label, status_cb=self.status_cb)
-				pins.append(pin)
-				continue
-
-			if cmd == 'pwm':
-				pth, id = arg.split(maxsplit=1)
-				name = "pwm_" + id
-				label = "PWM " + id
-				pin = PwmPin(name, pth, label, status_cb=self.status_cb)
-				pins.append(pin)
-				continue
-
-			if cmd == 'output':
-				pth, id = arg.split(maxsplit=1)
-				name = "output_" + id
-				label = "Output " + id
-				pth = pth + '/value'
-				pin = OutputPin(name, pth, label, status_cb=self.status_cb)
-				pins.append(pin)
-				continue
-
+			try:
+				cmd, arg = line.strip().split(maxsplit=1)
+				if cmd == 'tag':
+					continue
+				pins.append(Pin.create(self._dbusService, self._settings, self._serial, cmd, arg))
+			except Exception as e:
+				logger.error("Error parsing line in config file '{}': {}".format(line.strip(), e))
 		f.close()
 		return pins
 
