@@ -3,6 +3,7 @@
 import sys, os
 import signal
 from functools import partial
+from select import epoll, EPOLLIN, EPOLLPRI, EPOLLERR
 from argparse import ArgumentParser
 import traceback
 import logging
@@ -45,6 +46,10 @@ class OutputFunction(IntEnum):
 	CONNECTED_GENSET_HELPER_RELAY = 5
 	S2_RM = 6
 
+class InputType(IntEnum):
+	DISCRETE_VALUE_INDICATOR = 0
+	# For the IO extender, we only need the discrete type.
+
 class ModuleState(IntEnum):
 	CONNECTED = 0x100
 	OVER_TEMPERATURE = 0x101
@@ -59,6 +64,97 @@ STATUS_OUTPUT_FAULT = 0x08
 STATUS_DISABLED = 0x20
 
 background_tasks = set()
+
+class PinIo:
+	def __init__(self, interval=1.0):
+		self._interval = interval
+		self._pins = {}
+		self._fds = {}
+		self._task = None
+		self._running = False
+		self.ob = epoll()
+
+	def register(self, pin):
+		if pin in self._pins:
+			return
+		path = getattr(pin, "path", None)
+		if not path:
+			return
+		# Set up gpio for rising edge interrupts
+		try:
+			with open(os.path.join(os.path.dirname(path), 'edge'), 'ab') as fd:
+				fd.write(b'both')
+		except:
+			pass
+
+		fd = os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), 'rb')
+		self._pins[pin] = None
+		self._fds[pin] = fd
+		self.ob.register(fd.fileno(), EPOLLPRI)
+
+	def unregister(self, pin):
+		fd = self._fds.pop(pin, None)
+		self._pins.pop(pin, None)
+		if fd is None:
+			return
+		try:
+			self.ob.unregister(fd.fileno())
+		except OSError:
+			pass
+		try:
+			fd.close()
+		except OSError:
+			pass
+
+	def start(self):
+		if self._running:
+			return
+		self._running = True
+		if self._task is None:
+			self._task = asyncio.get_running_loop().create_task(self._run())
+
+	async def stop(self):
+		self._running = False
+		if self._task and not self._task.done():
+			self._task.cancel()
+			try:
+				await self._task
+			except asyncio.CancelledError:
+				pass
+		self._task = None
+		for fd in list(self._fds.values()):
+			try:
+				self.ob.unregister(fd.fileno())
+			except OSError:
+				pass
+			try:
+				fd.close()
+			except OSError:
+				pass
+		self._fds.clear()
+		self._pins.clear()
+
+	async def _run(self):
+		try:
+			while self._running:
+				await asyncio.get_running_loop().run_in_executor(
+					None, self.ob.poll, self._interval
+				)
+
+				for pin, fd in list(self._fds.items()):
+					try:
+						os.lseek(fd.fileno(), 0, os.SEEK_SET)
+						v = int(fd.read(1))
+
+						if v != self._pins.get(pin):
+							pin.set_value(v)
+							self._pins[pin] = v
+					except:
+						continue
+		except asyncio.CancelledError:
+			return
+
+PIN_IO = PinIo()
 
 # Base class for all pins.
 class Pin():
@@ -99,16 +195,18 @@ class Pin():
 			pin = OutputPin(name, pth + '/value', label)
 
 		elif cmd == 'input':
-			pass # Inputs are not supported yet.
+			name = "input_" + id
+			label = "Input " + id
+			pin = InputPin(name, pth + '/value', label)
 
 		else:
 			raise ValueError("Unknown pin type: {}".format(cmd))
 
-		pin.set_resources(service, settings, serial, f'/SwitchableOutput/{name}/')
+		pin.set_resources(service, settings, serial)
 		return pin
 
 	def __init__(self, name=None, path=None, label=None):
-		self._output_type = None
+		self._type = None
 		self._valid_types = None
 		self._function = OutputFunction.MANUAL
 		self._valid_functions = (1 << OutputFunction.MANUAL)
@@ -119,10 +217,9 @@ class Pin():
 		self.path = path
 		self.label = label
 
-	def set_resources(self, service, settings, serial, path_base):
+	def set_resources(self, service, settings, serial):
 		self._service = service
 		self._settings = settings
-		self._path_base = path_base
 		self._serial = serial
 
 	def types_to_mask(self, types):
@@ -135,13 +232,19 @@ class Pin():
 		if self._service is None or self._settings is None:
 			raise RuntimeError("Pin resources not set")
 		channel = self.name
+		store_type = False
 		# Make settings
-		await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Group", "", alias=f"Group_{channel}"),
+		settings = [Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Group", "", alias=f"Group_{channel}"),
 			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/CustomName", "", alias=f"CustomName_{channel}"),
-			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/ShowUIControl", 1, 0, 6, alias=f"ShowUIControl_{channel}"),
-			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Type", self._output_type, 0, 2, alias=f"Type_{channel}"))
+			Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/ShowUIControl", 1, 0, 6, alias=f"ShowUIControl_{channel}")]
+		# Only store the type if there are multiple valid types
+		if int.bit_count(self._valid_types) > 1:
+			store_type = True
+			settings.append(Setting(f"/Settings/Devices/gxio_{self._serial}/{channel}/Type", self._type, 0, 2, alias=f"Type_{channel}"))
 
-		self._output_type = self._settings.get_value(self._settings.alias(f'Type_{channel}'))
+		await self._settings.add_settings(*settings)
+		if store_type:
+			self._type = self._settings.get_value(self._settings.alias(f'Type_{channel}'))
 
 		# Generic channel paths
 		self._service.add_item(TextItem(self._path_base + 'Settings/Group', self._settings.get_value(self._settings.alias(f'Group_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/Group')))
@@ -149,7 +252,7 @@ class Pin():
 		self._service.add_item(IntegerItem(self._path_base + 'Settings/ShowUIControl', self._settings.get_value(self._settings.alias(f'ShowUIControl_{channel}')), writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/ShowUIControl')))
 		self._service.add_item(TextItem(self._path_base + 'Name', self.label, writeable=False))
 
-		self._service.add_item(IntegerItem(self._path_base + 'Settings/Type', self._output_type, writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/Type'),
+		self._service.add_item(IntegerItem(self._path_base + 'Settings/Type', self._type, writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/Type'),
 							text=self._type_text_callback))
 		self._service.add_item(IntegerItem(self._path_base + 'Settings/ValidTypes', self._valid_types, writeable=False, text=self._valid_types_text_callback))
 		self._service.add_item(IntegerItem(self._path_base + 'Settings/Function', OutputFunction.MANUAL, writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/Function'),
@@ -177,6 +280,9 @@ class Pin():
 			traceback.print_exc()
 			return None
 
+	def supports_interrupts(self):
+		return False
+
 	async def _handle_changed_value(self, path, item, value):
 		split = path.split('/')
 		if len(split) > 3 and split[3] == 'Settings':
@@ -199,6 +305,10 @@ class Pin():
 				if not ((1 << value) & self._service[validFunctionsPath]):
 					return
 
+			# Other setting specific for input or output, pass on
+			else:
+				self._on_setting_changed(split[-1], value)
+
 			setting = split[-1] + '_' + split[-3]
 			try:
 				if await self._settings.set_value(self._settings.alias(setting), value) < 0:
@@ -209,6 +319,9 @@ class Pin():
 			return
 
 		item.set_local_value(value)
+
+	def _on_setting_changed(self, path, value):
+		pass
 
 	async def set_hw_state(self, state):
 		raise NotImplementedError
@@ -278,17 +391,56 @@ class Pin():
 		]
 		return self._bitmask_text(value, entries)
 
-class OutputPin(Pin):
+class InputPin(Pin):
 	def __init__(self, name=None, path=None, label=None):
-		super(OutputPin, self).__init__(name=name, path=path, label=label)
-		self._output_type = OutputType.TOGGLE
-		self._valid_types = self.types_to_mask([OutputType.MOMENTARY, OutputType.TOGGLE])
+		super(InputPin, self).__init__(name=name, path=path, label=label)
+		self._path_base = f'/GenericInput/{name}/'
+		self._type = InputType.DISCRETE_VALUE_INDICATOR
+		self._valid_types = self.types_to_mask([InputType.DISCRETE_VALUE_INDICATOR])
+		self._invert = False
+		self._value_item = None
 
 	async def ainit(self):
 		await super().ainit()
 
+		await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{self.name}/Invert", 0, 0, 1, alias=f"Invert_{self.name}"))
+
+		self._service.add_item(IntegerItem(self._path_base + 'Status', 0x00, writeable=False)) # status 0x00: OK
+		self._value_item = IntegerItem(self._path_base + 'Value', self.read(self.path), writeable=False)
+		self._service.add_item(self._value_item)
+		self._service.add_item(IntegerItem(self._path_base + 'Settings/Invert', 0, writeable=True, onchange=partial(self._handle_changed_value, self._path_base + 'Settings/Invert')))
+		self._service.add_item(TextItem(self._path_base + 'Settings/Unit', "", writeable=True, onchange=self.set_unit))
+
+		PIN_IO.register(self)
+
+	async def set_unit(self, item, value):
+		item.set_local_value(value)
+
+	def _on_setting_changed(self, setting, value):
+		if setting == 'Invert':
+			self._invert = bool(value)
+			self.set_value(self.read(self.path))
+
+	def set_value(self, value):
+		if self._value_item:
+			if self._invert:
+				value = 0 if value else 1
+			self._value_item.set_local_value(value)
+
+	async def stop(self):
+		PIN_IO.unregister(self)
+
+class OutputPin(Pin):
+	def __init__(self, name=None, path=None, label=None):
+		super(OutputPin, self).__init__(name=name, path=path, label=label)
+		self._path_base = f'/SwitchableOutput/{name}/'
+		self._type = OutputType.TOGGLE
+		self._valid_types = self.types_to_mask([OutputType.MOMENTARY, OutputType.TOGGLE])
+
+	async def ainit(self):
+		await super().ainit()
 		# Fetch type from settings
-		self._output_type = OutputType(self._settings.get_value(self._settings.alias(f'Type_{self.name}')))
+		self._type = OutputType(self._settings.get_value(self._settings.alias(f'Type_{self.name}')))
 
 		if self._store_state:
 			await self._settings.add_settings(Setting(f"/Settings/Devices/gxio_{self._serial}/{self.name}/State", 0, 0, 1, alias=f"State_{self.name}"))
@@ -296,7 +448,6 @@ class OutputPin(Pin):
 
 		self._service.add_item(IntegerItem(self._path_base + 'State', self._state, writeable=True, onchange=self.set_state))
 		self._service.add_item(IntegerItem(self._path_base + 'Status', STATUS_ON if self._state else STATUS_OFF, writeable=False, text=self._status_text_callback))
-
 		# Set initial state
 		if self._store_state:
 			await self.set_hw_state(self._settings.get_value(self._settings.alias(f'State_{self.name}')))
@@ -313,7 +464,7 @@ class OutputPin(Pin):
 		await self.set_hw_state(value)
 		item.set_local_value(value)
 		# No point in storing the state for momentary outputs as they should always start off.
-		if self._store_state and self._output_type != OutputType.MOMENTARY:
+		if self._store_state and self._type != OutputType.MOMENTARY:
 			await self._settings.set_value(self._settings.alias(f'State_{self.name}'), self._state)
 
 	async def set_hw_state(self, state):
@@ -328,7 +479,7 @@ class OutputPin(Pin):
 class PwmPin(OutputPin):
 	def __init__(self, name=None, path=None, label=None):
 		super(PwmPin, self).__init__(name=name, path=path, label=label)
-		self._output_type = OutputType.DIMMABLE
+		self._type = OutputType.DIMMABLE
 		self._valid_types = self.types_to_mask([OutputType.DIMMABLE])
 		self._dimming = 0
 		self._write_dimming_timer = None
@@ -403,7 +554,7 @@ class BiStableRelay(OutputPin):
 	CHECK_INT = 100 # milliseconds
 	def __init__(self, name=None, set_path=None, res_path=None, label=None, fb_path=None):
 		super(BiStableRelay, self).__init__(name=name, label=label)
-		self._output_type = OutputType.TOGGLE
+		self._type = OutputType.TOGGLE
 		self._valid_types = self.types_to_mask([OutputType.MOMENTARY, OutputType.TOGGLE])
 		self._setpath = set_path
 		self._respath = res_path
@@ -519,6 +670,10 @@ class GxIoExtender():
 		# Create the D-Bus service
 		self._dbusService = Service(self.bus, self._serviceName)
 
+		self.pins = self.parse_config(config_file)
+		if self.pins is None or len(self.pins) == 0:
+			raise RuntimeError("No pins configured")
+
 		# Obtain the class and vrm instance from localsettings
 		await self._settings.add_settings(Setting(f"/Settings/Devices/{self._productNameSettings}/ClassAndVrmInstance", "switch:50", alias="deviceinstance"),
 			Setting(f"/Settings/Devices/{self._productNameSettings}/CustomName", "", alias="customname"))
@@ -535,7 +690,6 @@ class GxIoExtender():
 		self._dbusService.add_item(IntegerItem('/State', ModuleState.CONNECTED, writeable=False, text=self._module_state_text_callback))
 		self._dbusService.add_item(IntegerItem('/DeviceInstance', int(self._settings.get_value(self._settings.alias('deviceinstance')).split(':')[-1])))
 
-		self.pins = self.parse_config(config_file)
 		try:
 			await asyncio.gather(*(pin.ainit() for pin in self.pins), return_exceptions=True)
 		except Exception as e:
@@ -543,6 +697,7 @@ class GxIoExtender():
 
 		# Register on dbus
 		await self._dbusService.register()
+		PIN_IO.start()
 
 	def _module_state_text_callback(self, value):
 		state_map = {
@@ -561,6 +716,7 @@ class GxIoExtender():
 		except Exception as e:
 			logger.error("Error stopping pins: {}".format(e))
 
+		await PIN_IO.stop()
 		if self._dbusService:
 			await self._dbusService.close()
 
