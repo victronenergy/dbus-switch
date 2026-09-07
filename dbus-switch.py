@@ -37,6 +37,9 @@ MODULE_STATE_CHANNEL_FAULT = 0x103
 MODULE_STATE_CHANNEL_TRIPPED = 0x104
 MODULE_STATE_UNDER_VOLTAGE = 0x105
 
+# /SwitchableOutput/Capabilities (added in Venus OS 3.90) is used to indicate module-wide capabilities.
+MODULE_CAPABILITIES = 0x01 # Module supports showing/hiding on Watch App UI.
+
 STATUS_OFF = 0x00
 STATUS_ON = 0x09
 STATUS_OUTPUT_FAULT = 0x08
@@ -257,6 +260,7 @@ class SwitchingDevice(object):
 		self.paths['/CustomName'] = {'value': self._settings['customname'], 'writeable': True, 'onchangecallback': self._handle_changed_value}
 		self.paths['/Serial'] = {'value': self._serial, 'writeable': False}
 		self.paths['/State'] = {'value': MODULE_STATE_CONNECTED, 'writeable': False, 'gettextcallback': self._module_state_text_callback}
+		self.paths['/SwitchableOutput/Capabilities'] = {'value': MODULE_CAPABILITIES, 'writeable': False}
 
 		self._dbusService = self._create_dbus_service()
 
@@ -453,7 +457,7 @@ class GxIoExtender(SwitchingDevice):
 
 			self.settings['Group_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Group' % (self._serial, channel), '', '', '']
 			self.settings['CustomName_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/CustomName' % (self._serial, channel), '', '', '']
-			self.settings['ShowUIControl_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/ShowUIControl' % (self._serial, channel), 1, 0, 6]
+			self.settings['ShowUIControl_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/ShowUIControl' % (self._serial, channel), 1, 0, 0x0F]
 			self.settings['Type_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Type' % (self._serial, channel), output_type, 0, 2]
 			# No setting for function, as it can only be manual.
 			if pin.store_state:
