@@ -298,7 +298,7 @@ class SwitchingDevice(object):
 							'writeable': False, 'gettextcallback': self._valid_types_text_callback}
 		self.paths[path_base + 'Settings/Function'] = {'value': OUTPUT_FUNCTION_MANUAL, 'writeable': True, 'onchangecallback': self._handle_changed_value,
 							'gettextcallback': self._function_text_callback}
-		self.paths[path_base + 'Settings/ValidFunctions'] = {'value': (1 << OUTPUT_FUNCTION_MANUAL), 
+		self.paths[path_base + 'Settings/ValidFunctions'] = {'value': (1 << OUTPUT_FUNCTION_ALARM | 1 << OUTPUT_FUNCTION_GENSET_START_STOP | 1 << OUTPUT_FUNCTION_MANUAL),
 							'writeable': False, 'gettextcallback': self._valid_functions_text_callback}
 
 	def _module_state_text_callback(self, path, value):
@@ -459,7 +459,7 @@ class GxIoExtender(SwitchingDevice):
 			self.settings['CustomName_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/CustomName' % (self._serial, channel), '', '', '']
 			self.settings['ShowUIControl_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/ShowUIControl' % (self._serial, channel), 1, 0, 0x0F]
 			self.settings['Type_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Type' % (self._serial, channel), output_type, 0, 2]
-			# No setting for function, as it can only be manual.
+			self.settings['Function_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/Function' % (self._serial, channel), OUTPUT_FUNCTION_MANUAL, 0, 5]
 			if pin.store_state:
 				self.settings['State_%s' % channel] = ['/Settings/Devices/gxio_%s/%s/State' % (self._serial, channel), 0, 0, 1]
 
